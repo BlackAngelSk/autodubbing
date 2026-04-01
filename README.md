@@ -54,7 +54,12 @@ UI flow:
 5. Optionally set `Start Time` and `End Time` to dub only a part of the video.
 6. Click **Generate Dubbed Video**.
 7. Watch live progress with ETA while it processes.
-8. Preview output and read logs.
+8. Use **Cancel Current Run** if you need to stop processing.
+9. Expand **Advanced Voice Timing Controls** to tune:
+  - Original audio mix level under dubbed speech.
+  - Min/Max stretch speed for timing fit.
+  - Silence trim around synthesized speech segments.
+10. Preview output and read logs.
 
 Generated videos are saved in `outputs/`.
 
@@ -123,3 +128,4 @@ If `--keep-temp` is passed, the script will show the temp directory path so you 
 - For more natural speech, use `edge` engine and a voice matching your target language.
 - If the UI does not open, check that Gradio installed successfully: `pip install -r requirements.txt`.
 - If YouTube download fails, update downloader: `pip install -U yt-dlp`.
+- If a YouTube link still fails, try a direct watch URL (not playlist/channel links).

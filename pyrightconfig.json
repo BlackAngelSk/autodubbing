@@ -1,6 +1,8 @@
 {
   "venvPath": ".",
   "venv": ".venv",
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
   "include": [
     "autodub.py",
     "ui.py"

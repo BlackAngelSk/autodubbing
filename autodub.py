@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import importlib
 import json
 import re
@@ -46,6 +47,109 @@ class Segment:
     translated_text: str = ""
 
 
+def format_srt_timestamp(seconds: float) -> str:
+    total_ms = max(int(round(seconds * 1000)), 0)
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def write_srt(segments: Iterable[Segment], srt_path: Path) -> None:
+    lines: list[str] = []
+    for index, seg in enumerate(segments, start=1):
+        subtitle_text = (seg.translated_text or seg.source_text).strip()
+        if not subtitle_text:
+            continue
+        lines.extend(
+            [
+                str(index),
+                f"{format_srt_timestamp(seg.start_s)} --> {format_srt_timestamp(seg.end_s)}",
+                subtitle_text,
+                "",
+            ]
+        )
+    srt_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
+def parse_glossary_overrides(glossary_text: str | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    if not glossary_text:
+        return overrides
+
+    for raw_line in glossary_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        separator = "=>" if "=>" in line else "->" if "->" in line else "=" if "=" in line else None
+        if separator is None:
+            continue
+
+        source, replacement = (part.strip() for part in line.split(separator, 1))
+        if source and replacement:
+            overrides[source.lower()] = replacement
+
+    return overrides
+
+
+def apply_glossary_overrides(text: str, overrides: dict[str, str]) -> str:
+    adjusted = text
+    for source, replacement in sorted(overrides.items(), key=lambda item: len(item[0]), reverse=True):
+        escaped = re.escape(source)
+        pattern = escaped if " " in source else rf"\b{escaped}\b"
+        adjusted = re.sub(pattern, replacement, adjusted, flags=re.IGNORECASE)
+    return adjusted
+
+
+def save_segments_to_json(segments: Iterable[Segment], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps([asdict(seg) for seg in segments], indent=2), encoding="utf-8")
+
+
+def load_segments_from_json(input_path: Path) -> List[Segment]:
+    raw = json.loads(input_path.read_text(encoding="utf-8"))
+    return [
+        Segment(
+            start_s=float(item["start_s"]),
+            end_s=float(item["end_s"]),
+            source_text=str(item["source_text"]),
+            translated_text=str(item.get("translated_text", "")),
+        )
+        for item in raw
+    ]
+
+
+def build_resume_dir(
+    input_path: Path,
+    output_dir: Path,
+    target_lang: str,
+    whisper_model: str,
+    tts_engine: str,
+    edge_voice: str | None,
+    optimization_profile: str,
+    start_time_s: float,
+    end_time_s: float | None,
+    glossary_text: str,
+) -> Path:
+    job_signature = "|".join(
+        [
+            str(input_path.resolve()),
+            target_lang,
+            whisper_model,
+            tts_engine,
+            edge_voice or "",
+            optimization_profile,
+            f"{start_time_s:.3f}",
+            "none" if end_time_s is None else f"{end_time_s:.3f}",
+            hashlib.sha1(glossary_text.encode("utf-8")).hexdigest()[:10],
+        ]
+    )
+    short_hash = hashlib.sha1(job_signature.encode("utf-8")).hexdigest()[:12]
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", input_path.stem)[:40] or "video"
+    return output_dir / ".autodub_resume" / f"{safe_stem}_{target_lang}_{short_hash}"
+
+
 def run_cmd(cmd: list[str]) -> None:
     """Run a subprocess command and fail with readable output."""
     try:
@@ -62,6 +166,95 @@ def run_cmd(cmd: list[str]) -> None:
 def ensure_ffmpeg() -> None:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is not installed or not on PATH")
+
+
+def probe_media_duration(media_path: Path) -> float | None:
+    """Best-effort media duration probe used for auto optimization decisions."""
+    if shutil.which("ffprobe") is None:
+        return None
+
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(media_path),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+    value = completed.stdout.strip()
+    if not value:
+        return None
+
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def resolve_processing_profile(
+    selected_profile: str,
+    clip_duration_s: float | None,
+    whisper_model: str,
+    device: str,
+    min_stretch_speed: float,
+    max_stretch_speed: float,
+    silence_trim_ms: int,
+) -> dict[str, Any]:
+    applied_profile = selected_profile
+    if selected_profile == "auto":
+        if clip_duration_s is not None and clip_duration_s <= 150:
+            applied_profile = "short"
+        elif clip_duration_s is not None and clip_duration_s >= 12 * 60:
+            applied_profile = "long"
+        else:
+            applied_profile = "balanced"
+
+    resolved_model = whisper_model
+    resolved_min = min_stretch_speed
+    resolved_max = max_stretch_speed
+    resolved_trim = silence_trim_ms
+    transcribe_chunk_s: float | None = None
+    tts_chunk_window_s: float | None = 75.0
+
+    if applied_profile == "short":
+        resolved_min = max(resolved_min, 0.90)
+        resolved_max = min(max(resolved_max, 1.45), 1.65)
+        resolved_trim = max(resolved_trim, 18)
+        tts_chunk_window_s = 60.0
+    elif applied_profile == "long":
+        if device != "cuda" and whisper_model in {"small", "medium"}:
+            resolved_model = "base"
+        resolved_min = min(resolved_min, 0.92)
+        resolved_max = max(resolved_max, 1.95)
+        resolved_trim = max(resolved_trim, 12)
+        transcribe_chunk_s = 420.0
+        tts_chunk_window_s = 120.0
+    else:
+        transcribe_chunk_s = 300.0 if clip_duration_s is not None and clip_duration_s >= 8 * 60 else None
+        tts_chunk_window_s = 90.0
+
+    return {
+        "label": applied_profile,
+        "whisper_model": resolved_model,
+        "min_stretch_speed": resolved_min,
+        "max_stretch_speed": resolved_max,
+        "silence_trim_ms": resolved_trim,
+        "clip_duration_s": clip_duration_s,
+        "transcribe_chunk_s": transcribe_chunk_s,
+        "tts_chunk_window_s": tts_chunk_window_s,
+    }
 
 
 def extract_audio(video_path: Path, audio_out: Path) -> None:
@@ -91,7 +284,14 @@ def trim_video(input_video: Path, output_video: Path, start_time_s: float, end_t
     run_cmd(cmd)
 
 
-def transcribe_segments(audio_path: Path, model_name: str, device: str) -> List[Segment]:
+def transcribe_segments(
+    audio_path: Path,
+    model_name: str,
+    device: str,
+    chunk_length_s: float | None = None,
+    cache_dir: Path | None = None,
+    chunk_progress_callback: Callable[[int, int], None] | None = None,
+) -> List[Segment]:
     model = WhisperModel(model_name, device=device, compute_type="int8")
 
     def normalize_text(text: str) -> str:
@@ -160,6 +360,41 @@ def transcribe_segments(audio_path: Path, model_name: str, device: str) -> List[
 
         return sorted(merged, key=lambda seg: seg.start_s)
 
+    def merge_tts_friendly_segments(existing_segments: List[Segment]) -> List[Segment]:
+        if not existing_segments:
+            return existing_segments
+
+        merged: List[Segment] = [existing_segments[0]]
+        for seg in existing_segments[1:]:
+            prev = merged[-1]
+            gap_s = max(seg.start_s - prev.end_s, 0.0)
+            prev_duration_s = prev.end_s - prev.start_s
+            combined_duration_s = seg.end_s - prev.start_s
+            prev_text = prev.source_text.strip()
+            next_text = seg.source_text.strip()
+            looks_like_continuation = (
+                (prev_text and prev_text[-1] not in ".!?;:")
+                or (next_text[:1].islower() if next_text else False)
+                or gap_s <= 0.05
+            )
+            should_merge = (
+                gap_s <= 0.16
+                and combined_duration_s <= 8.5
+                and (prev_duration_s <= 0.65 or looks_like_continuation)
+            )
+            if not should_merge:
+                merged.append(seg)
+                continue
+
+            joiner = "" if prev_text.endswith("-") or next_text.startswith(("-", "'")) else " "
+            merged[-1] = Segment(
+                start_s=prev.start_s,
+                end_s=max(prev.end_s, seg.end_s),
+                source_text=(f"{prev_text}{joiner}{next_text}").strip(),
+            )
+
+        return merged
+
     def collect_segments(target_audio_path: Path, vad_filter: bool, relaxed: bool = False) -> List[Segment]:
         transcribe_kwargs: dict[str, Any] = {
             "vad_filter": vad_filter,
@@ -185,11 +420,11 @@ def transcribe_segments(audio_path: Path, model_name: str, device: str) -> List[
             collected.append(Segment(start_s=start_s, end_s=end_s, source_text=text))
         return collected
 
-    def recover_tail_segments(existing_segments: List[Segment]) -> List[Segment]:
+    def recover_tail_segments(existing_segments: List[Segment], source_audio_path: Path) -> List[Segment]:
         if not existing_segments:
             return existing_segments
 
-        audio_duration_s = len(AudioSegment.from_wav(audio_path)) / 1000.0
+        audio_duration_s = len(AudioSegment.from_wav(source_audio_path)) / 1000.0
         last_end_s = existing_segments[-1].end_s
         trailing_gap_s = audio_duration_s - last_end_s
 
@@ -210,8 +445,8 @@ def transcribe_segments(audio_path: Path, model_name: str, device: str) -> List[
         ]
 
         for probe_index, tail_start_s in enumerate(probe_starts, start=1):
-            tail_audio = AudioSegment.from_wav(audio_path)[int(tail_start_s * 1000) :]
-            tail_path = audio_path.parent / f"tail_recheck_{probe_index}.wav"
+            tail_audio = AudioSegment.from_wav(source_audio_path)[int(tail_start_s * 1000) :]
+            tail_path = source_audio_path.parent / f"tail_recheck_{probe_index}.wav"
             tail_audio.export(tail_path, format="wav")
 
             recovered_segments = collect_segments(tail_path, vad_filter=False)
@@ -249,15 +484,91 @@ def transcribe_segments(audio_path: Path, model_name: str, device: str) -> List[
             return existing_segments
         return existing_segments + sorted(appended, key=lambda seg: seg.start_s)
 
-    primary_segments = collect_segments(audio_path, vad_filter=True)
-    recall_segments = collect_segments(audio_path, vad_filter=False, relaxed=True)
+    def transcribe_single_audio(target_audio_path: Path) -> List[Segment]:
+        primary_segments = collect_segments(target_audio_path, vad_filter=True)
+        recall_segments = collect_segments(target_audio_path, vad_filter=False, relaxed=True)
 
-    if primary_segments:
-        merged_segments = merge_recall_segments(primary_segments, recall_segments)
-        return recover_tail_segments(merged_segments)
+        if primary_segments:
+            merged_segments = merge_recall_segments(primary_segments, recall_segments)
+            recovered = recover_tail_segments(merged_segments, target_audio_path)
+            return merge_tts_friendly_segments(recovered)
 
-    # If VAD pass found nothing, use relaxed no-VAD pass.
-    return recover_tail_segments(recall_segments)
+        # If VAD pass found nothing, use relaxed no-VAD pass.
+        recovered = recover_tail_segments(recall_segments, target_audio_path)
+        return merge_tts_friendly_segments(recovered)
+
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        full_cache_path = cache_dir / f"segments_{model_name}_{device}.json"
+        if full_cache_path.exists():
+            return load_segments_from_json(full_cache_path)
+    else:
+        full_cache_path = None
+
+    audio_duration_s = len(AudioSegment.from_wav(audio_path)) / 1000.0
+    should_chunk = chunk_length_s is not None and audio_duration_s > max(chunk_length_s * 1.15, 90.0)
+
+    if should_chunk and chunk_length_s is not None:
+        merged_all: List[Segment] = []
+        chunk_start_s = 0.0
+        step_s = max(chunk_length_s - 1.25, 30.0)
+        total_chunks = max(int((audio_duration_s - 0.001) // step_s) + 1, 1)
+
+        for chunk_index in range(total_chunks):
+            chunk_start_s = min(chunk_index * step_s, max(audio_duration_s - 1.0, 0.0))
+            chunk_end_s = min(chunk_start_s + chunk_length_s, audio_duration_s)
+            if chunk_end_s <= chunk_start_s + 0.1:
+                continue
+
+            chunk_json_path = cache_dir / f"asr_chunk_{chunk_index + 1:04d}.json" if cache_dir is not None else None
+            if chunk_json_path is not None and chunk_json_path.exists():
+                chunk_segments = load_segments_from_json(chunk_json_path)
+            else:
+                chunk_wav_path = (
+                    cache_dir / f"asr_chunk_{chunk_index + 1:04d}.wav"
+                    if cache_dir is not None
+                    else audio_path.parent / f"asr_chunk_{chunk_index + 1:04d}.wav"
+                )
+                run_cmd(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(audio_path),
+                        "-ss",
+                        f"{chunk_start_s:.3f}",
+                        "-to",
+                        f"{chunk_end_s:.3f}",
+                        "-acodec",
+                        "pcm_s16le",
+                        str(chunk_wav_path),
+                    ]
+                )
+                local_segments = transcribe_single_audio(chunk_wav_path)
+                chunk_segments = [
+                    Segment(
+                        start_s=seg.start_s + chunk_start_s,
+                        end_s=seg.end_s + chunk_start_s,
+                        source_text=seg.source_text,
+                        translated_text=seg.translated_text,
+                    )
+                    for seg in local_segments
+                ]
+                if chunk_json_path is not None:
+                    save_segments_to_json(chunk_segments, chunk_json_path)
+
+            merged_all = merge_recall_segments(merged_all, chunk_segments) if merged_all else chunk_segments
+            if chunk_progress_callback is not None:
+                chunk_progress_callback(chunk_index + 1, total_chunks)
+
+        if full_cache_path is not None:
+            save_segments_to_json(merged_all, full_cache_path)
+        return merged_all
+
+    single_segments = transcribe_single_audio(audio_path)
+    if full_cache_path is not None:
+        save_segments_to_json(single_segments, full_cache_path)
+    return single_segments
 
 
 def english_word_tokens(text: str) -> set[str]:
@@ -406,10 +717,12 @@ def translate_segments_with_progress(
     segments: List[Segment],
     target_lang: str,
     segment_progress_callback: Callable[[int, int], None] | None = None,
+    glossary_overrides: dict[str, str] | None = None,
 ) -> None:
     translator = GoogleTranslator(source="auto", target=target_lang)
     fallback_translator = GoogleTranslator(source="en", target=target_lang)
     word_translator = GoogleTranslator(source="en", target=target_lang)
+    translation_cache: dict[str, str] = {}
 
     def should_retry_with_english_source(source_text: str, translated_text: str) -> bool:
         if target_lang == "en":
@@ -428,17 +741,28 @@ def translate_segments_with_progress(
     total = len(segments)
     unchanged_count = 0
     for idx, seg in enumerate(tqdm(segments, desc="Translating"), start=1):
-        translated = safe_translate(seg.source_text, translator, fallback_translator)
+        source_key = re.sub(r"\s+", " ", seg.source_text).strip().lower()
+        cached_translation = translation_cache.get(source_key)
 
-        if should_retry_with_english_source(seg.source_text, translated) or has_untranslated_english_tokens(
-            seg.source_text, translated, target_lang
-        ):
-            retry = safe_translate(seg.source_text, fallback_translator, translator)
-            if retry is not None and retry.strip():
-                translated = retry
+        if cached_translation is not None:
+            translated = cached_translation
+        else:
+            translated = safe_translate(seg.source_text, translator, fallback_translator)
 
-        if has_untranslated_english_tokens(seg.source_text, translated, target_lang):
-            translated = replace_untranslated_tokens(seg.source_text, translated, word_translator)
+            if should_retry_with_english_source(seg.source_text, translated) or has_untranslated_english_tokens(
+                seg.source_text, translated, target_lang
+            ):
+                retry = safe_translate(seg.source_text, fallback_translator, translator)
+                if retry is not None and retry.strip():
+                    translated = retry
+
+            if has_untranslated_english_tokens(seg.source_text, translated, target_lang):
+                translated = replace_untranslated_tokens(seg.source_text, translated, word_translator)
+
+            translation_cache[source_key] = translated
+
+        if glossary_overrides:
+            translated = apply_glossary_overrides(translated, glossary_overrides)
 
         if target_lang != "en":
             source_clean = re.sub(r"\s+", " ", seg.source_text).strip().lower()
@@ -611,7 +935,7 @@ def fit_audio_to_duration_with_controls(
         if overflow_speed > 1.03:
             # Keep emergency compression bounded so a single difficult line does
             # not become unnaturally fast.
-            safety_speed = min(max(overflow_speed, 1.0), max(max_stretch_speed + 0.35, 2.4))
+            safety_speed = min(max(overflow_speed, 1.0), max(max_stretch_speed + 0.18, 1.95))
             if abs(safety_speed - 1.0) > 0.03:
                 audio = stretch_audio_preserve_pitch(audio, safety_speed, temp_dir, f"seg_{segment_index:05d}_safe")
 
@@ -635,71 +959,114 @@ def build_dubbed_track(
     max_stretch_speed: float = 1.20,
     silence_trim_ms: int = 0,
     segment_progress_callback: Callable[[int, int], None] | None = None,
+    chunk_window_s: float | None = None,
+    cache_dir: Path | None = None,
 ) -> AudioSegment:
     dubbed = AudioSegment.silent(duration=total_duration_ms)
     total = len(segments)
+    voice_cache: dict[tuple[str, str, str, str, str], AudioSegment] = {}
 
-    for i, seg in enumerate(tqdm(segments, desc="Generating TTS"), start=1):
-        if not seg.translated_text:
-            if segment_progress_callback is not None:
-                segment_progress_callback(i, total)
-            continue
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
-        spoken_text = sanitize_tts_text(seg.translated_text)
-        if not spoken_text:
-            continue
+    def get_tts_audio(spoken_text: str, rate: str = "+0%") -> AudioSegment:
+        cache_key = (spoken_text, target_lang, tts_engine, edge_voice or "", rate)
+        cached_audio = voice_cache.get(cache_key)
+        if cached_audio is not None:
+            return cached_audio
 
-        mp3_path = temp_dir / f"tts_{i:05d}.mp3"
-        start_ms = max(int(seg.start_s * 1000), 0)
-        original_end_ms = max(int(seg.end_s * 1000), start_ms + 120)
-        if i < total:
-            next_start_ms = max(int(segments[i].start_s * 1000) - 60, original_end_ms)
-            allowed_end_ms = min(next_start_ms, total_duration_ms)
-        else:
-            allowed_end_ms = total_duration_ms
-        slot_ms = max(allowed_end_ms - start_ms, 120)
-
+        mp3_path = temp_dir / f"tts_cache_{len(voice_cache) + 1:05d}.mp3"
         tts_segment(
             spoken_text,
             target_lang,
             mp3_path,
             tts_engine=tts_engine,
             edge_voice=edge_voice,
+            edge_rate=rate,
         )
+        cached_audio = AudioSegment.from_file(mp3_path)
+        voice_cache[cache_key] = cached_audio
+        return cached_audio
 
-        voice = AudioSegment.from_file(mp3_path)
+    def synthesize_chunk(chunk_items: list[tuple[int, Segment]], chunk_start_ms: int, chunk_end_ms: int) -> AudioSegment:
+        chunk_audio = AudioSegment.silent(duration=max(chunk_end_ms - chunk_start_ms, 120))
+        for i, seg in chunk_items:
+            if not seg.translated_text:
+                if segment_progress_callback is not None:
+                    segment_progress_callback(i, total)
+                continue
 
-        if tts_engine == "edge" and slot_ms > 0:
-            natural_ratio = len(voice) / slot_ms
-            if natural_ratio > max_stretch_speed + 0.12:
-                adaptive_rate = format_edge_rate(int(min((natural_ratio - 1.0) * 55, 32)))
-                tts_segment(
-                    spoken_text,
-                    target_lang,
-                    mp3_path,
-                    tts_engine=tts_engine,
-                    edge_voice=edge_voice,
-                    edge_rate=adaptive_rate,
-                )
-                voice = AudioSegment.from_file(mp3_path)
+            spoken_text = sanitize_tts_text(seg.translated_text)
+            if not spoken_text:
+                if segment_progress_callback is not None:
+                    segment_progress_callback(i, total)
+                continue
 
-        if len(voice) > slot_ms and i < total:
-            overflow_ms = len(voice) - slot_ms
-            if overflow_ms > 0:
-                slot_ms = min(slot_ms + min(overflow_ms, 180), total_duration_ms - start_ms)
+            global_start_ms = max(int(seg.start_s * 1000), 0)
+            start_ms = max(global_start_ms - chunk_start_ms, 0)
+            original_end_ms = max(int(seg.end_s * 1000), global_start_ms + 120)
+            if i < total:
+                next_start_ms = max(int(segments[i].start_s * 1000) - 60, original_end_ms)
+                allowed_end_ms = min(next_start_ms, total_duration_ms)
+            else:
+                allowed_end_ms = total_duration_ms
+            slot_ms = max(allowed_end_ms - global_start_ms, 120)
 
-        voice = fit_audio_to_duration_with_controls(
-            voice,
-            slot_ms,
-            temp_dir,
-            i,
-            min_stretch_speed=min_stretch_speed,
-            max_stretch_speed=max_stretch_speed,
-            silence_trim_ms=silence_trim_ms,
-        )
-        dubbed = dubbed.overlay(voice, position=start_ms)
-        if segment_progress_callback is not None:
-            segment_progress_callback(i, total)
+            voice = get_tts_audio(spoken_text)
+
+            if tts_engine == "edge" and slot_ms > 0:
+                natural_ratio = len(voice) / slot_ms
+                if natural_ratio > max_stretch_speed + 0.12:
+                    adaptive_rate = format_edge_rate(int(min((natural_ratio - 1.0) * 28, 18)))
+                    voice = get_tts_audio(spoken_text, rate=adaptive_rate)
+
+            if len(voice) > slot_ms and i < total:
+                overflow_ms = len(voice) - slot_ms
+                if overflow_ms > 0:
+                    slot_ms = min(slot_ms + min(overflow_ms, 320), total_duration_ms - global_start_ms)
+
+            voice = fit_audio_to_duration_with_controls(
+                voice,
+                slot_ms,
+                temp_dir,
+                i,
+                min_stretch_speed=min_stretch_speed,
+                max_stretch_speed=max_stretch_speed,
+                silence_trim_ms=silence_trim_ms,
+            )
+            chunk_audio = chunk_audio.overlay(voice, position=start_ms)
+            if segment_progress_callback is not None:
+                segment_progress_callback(i, total)
+
+        return chunk_audio
+
+    if not segments:
+        return dubbed
+
+    chunk_window_ms = int((chunk_window_s or (total_duration_ms / 1000.0)) * 1000)
+    chunk_window_ms = max(chunk_window_ms, 15_000)
+    chunk_pad_ms = 1_200
+    grouped: dict[int, list[tuple[int, Segment]]] = {}
+    for i, seg in enumerate(segments, start=1):
+        chunk_index = int(max(seg.start_s * 1000, 0) // chunk_window_ms)
+        grouped.setdefault(chunk_index, []).append((i, seg))
+
+    for chunk_index in sorted(grouped):
+        chunk_start_ms = chunk_index * chunk_window_ms
+        chunk_end_ms = min(chunk_start_ms + chunk_window_ms + chunk_pad_ms, total_duration_ms)
+        chunk_path = cache_dir / f"dub_chunk_{chunk_index:04d}.wav" if cache_dir is not None else None
+
+        if chunk_path is not None and chunk_path.exists():
+            chunk_audio = AudioSegment.from_wav(chunk_path)
+            for i, _seg in grouped[chunk_index]:
+                if segment_progress_callback is not None:
+                    segment_progress_callback(i, total)
+        else:
+            chunk_audio = synthesize_chunk(grouped[chunk_index], chunk_start_ms, chunk_end_ms)
+            if chunk_path is not None:
+                chunk_audio.export(chunk_path, format="wav")
+
+        dubbed = dubbed.overlay(chunk_audio, position=chunk_start_ms)
 
     return dubbed
 
@@ -748,6 +1115,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-time", type=float, default=0.0, help="Start time in seconds for dubbing window")
     parser.add_argument("--end-time", type=float, default=None, help="Optional end time in seconds for dubbing window")
     parser.add_argument("--keep-temp", action="store_true", help="Keep intermediate files")
+    parser.add_argument(
+        "--optimization-profile",
+        default="auto",
+        choices=["auto", "short", "long"],
+        help="Auto-tune settings for short or long videos",
+    )
+    parser.add_argument("--no-export-srt", action="store_true", help="Skip translated subtitle export")
+    parser.add_argument("--no-resume", action="store_true", help="Disable resume cache reuse across reruns")
+    parser.add_argument(
+        "--glossary-file",
+        type=Path,
+        default=None,
+        help="Optional glossary override file with 'source => replacement' rules",
+    )
     return parser.parse_args()
 
 
@@ -763,6 +1144,10 @@ def autodub_video(
     min_stretch_speed: float = 0.85,
     max_stretch_speed: float = 1.80,
     silence_trim_ms: int = 0,
+    optimization_profile: str = "auto",
+    export_srt: bool = True,
+    resume_enabled: bool = True,
+    glossary_text: str = "",
     start_time_s: float = 0.0,
     end_time_s: float | None = None,
     keep_temp: bool = False,
@@ -797,32 +1182,100 @@ def autodub_video(
 
     temp_base = Path(tempfile.mkdtemp(prefix="autodub_"))
     try:
+        resume_dir = None
+        if resume_enabled:
+            resume_dir = build_resume_dir(
+                input_path=input_path,
+                output_dir=output_path.parent,
+                target_lang=target_lang,
+                whisper_model=whisper_model,
+                tts_engine=tts_engine,
+                edge_voice=edge_voice,
+                optimization_profile=optimization_profile,
+                start_time_s=start_time_s,
+                end_time_s=end_time_s,
+                glossary_text=glossary_text,
+            )
+            resume_dir.mkdir(parents=True, exist_ok=True)
+            report(f"[resume] Cache directory: {resume_dir}")
+
         working_video = input_path
-        extracted_wav = temp_base / "extracted.wav"
-        dubbed_wav = temp_base / "dubbed.wav"
-        segments_json = temp_base / "segments.json"
+        extracted_wav = (resume_dir / "extracted.wav") if resume_dir is not None else (temp_base / "extracted.wav")
+        dubbed_wav = (resume_dir / "dubbed.wav") if resume_dir is not None else (temp_base / "dubbed.wav")
+        segments_json = (resume_dir / "segments.json") if resume_dir is not None else (temp_base / "segments.json")
+        asr_cache_dir = (resume_dir / "asr") if resume_dir is not None else None
+        tts_cache_dir = (resume_dir / "tts_chunks") if resume_dir is not None else None
+        subtitle_path = output_path.with_suffix(".srt")
+        glossary_overrides = parse_glossary_overrides(glossary_text)
 
         if start_time_s > 0 or end_time_s is not None:
-            report("[0/5] Trimming selected video range...")
-            report_progress(0.01, "Preparing selected time range")
-            clipped_video = temp_base / "trimmed_input.mp4"
-            trim_video(input_path, clipped_video, start_time_s, end_time_s)
+            clipped_video = (resume_dir / "trimmed_input.mp4") if resume_dir is not None else (temp_base / "trimmed_input.mp4")
+            if clipped_video.exists():
+                report("[resume] Reusing trimmed video range...")
+            else:
+                report("[0/5] Trimming selected video range...")
+                report_progress(0.01, "Preparing selected time range")
+                trim_video(input_path, clipped_video, start_time_s, end_time_s)
             working_video = clipped_video
 
+        resolved_settings = resolve_processing_profile(
+            optimization_profile,
+            probe_media_duration(working_video),
+            whisper_model,
+            device,
+            min_stretch_speed,
+            max_stretch_speed,
+            silence_trim_ms,
+        )
+        clip_duration_s = resolved_settings["clip_duration_s"]
+        clip_label = "unknown length"
+        if isinstance(clip_duration_s, float):
+            clip_label = f"{clip_duration_s / 60:.1f} min" if clip_duration_s >= 60 else f"{clip_duration_s:.0f} sec"
+        report(
+            "[opt] "
+            f"Profile={resolved_settings['label']} | clip={clip_label} | "
+            f"Whisper={resolved_settings['whisper_model']}"
+        )
+
         report("[1/5] Extracting audio...")
-        report_progress(0.03, "Extracting audio")
-        extract_audio(working_video, extracted_wav)
-        report_progress(0.10, "Audio extracted")
+        if extracted_wav.exists():
+            report("[resume] Reusing extracted audio cache...")
+            report_progress(0.10, "Audio extracted")
+        else:
+            report_progress(0.03, "Extracting audio")
+            extract_audio(working_video, extracted_wav)
+            report_progress(0.10, "Audio extracted")
 
         report("[2/5] Transcribing with Whisper...")
-        report_progress(0.12, "Transcribing speech")
-        segments = transcribe_segments(extracted_wav, whisper_model, device)
+        if segments_json.exists():
+            segments = load_segments_from_json(segments_json)
+            report(f"[resume] Reusing cached segments ({len(segments)} segments)...")
+            report_progress(0.35, f"Transcription complete ({len(segments)} segments)")
+        else:
+            report_progress(0.12, "Transcribing speech")
+
+            def asr_chunk_progress(done: int, total: int) -> None:
+                start = 0.12
+                end = 0.35
+                fraction = done / max(total, 1)
+                report_progress(start + (end - start) * fraction, f"Transcribing chunks ({done}/{total})")
+
+            segments = transcribe_segments(
+                extracted_wav,
+                cast(str, resolved_settings["whisper_model"]),
+                device,
+                chunk_length_s=cast(float | None, resolved_settings["transcribe_chunk_s"]),
+                cache_dir=asr_cache_dir,
+                chunk_progress_callback=asr_chunk_progress,
+            )
+            save_segments_to_json(segments, segments_json)
+            report_progress(0.35, f"Transcription complete ({len(segments)} segments)")
+
         if not segments:
             raise RuntimeError(
                 "No speech segments found in the selected range. "
                 "Try a different time window, use a larger Whisper model, or increase spoken content."
             )
-        report_progress(0.35, f"Transcription complete ({len(segments)} segments)")
 
         report("[3/5] Translating segments...")
 
@@ -832,33 +1285,54 @@ def autodub_video(
             fraction = done / max(total, 1)
             report_progress(start + (end - start) * fraction, f"Translating ({done}/{total})")
 
-        translate_segments_with_progress(segments, target_lang, segment_progress_callback=translation_progress)
+        needs_translation = any(not seg.translated_text.strip() for seg in segments)
+        if needs_translation:
+            translate_segments_with_progress(
+                segments,
+                target_lang,
+                segment_progress_callback=translation_progress,
+                glossary_overrides=glossary_overrides,
+            )
+            save_segments_to_json(segments, segments_json)
+        else:
+            report("[resume] Reusing cached translations...")
+            report_progress(0.60, f"Translating ({len(segments)}/{len(segments)})")
+
+        if export_srt:
+            write_srt(segments, subtitle_path)
+            report(f"[srt] Subtitle file written to: {subtitle_path}")
 
         report("[4/5] Generating dubbed track...")
-        report_progress(0.62, "Generating neural voice")
+        if dubbed_wav.exists():
+            report("[resume] Reusing cached dubbed audio...")
+            report_progress(0.90, "Synthesizing voice (cached)")
+        else:
+            report_progress(0.62, "Generating neural voice")
 
-        def tts_progress(done: int, total: int) -> None:
-            start = 0.62
-            end = 0.90
-            fraction = done / max(total, 1)
-            report_progress(start + (end - start) * fraction, f"Synthesizing voice ({done}/{total})")
+            def tts_progress(done: int, total: int) -> None:
+                start = 0.62
+                end = 0.90
+                fraction = done / max(total, 1)
+                report_progress(start + (end - start) * fraction, f"Synthesizing voice ({done}/{total})")
 
-        base_audio = AudioSegment.from_wav(extracted_wav)
-        dubbed_track = build_dubbed_track(
-            segments,
-            len(base_audio),
-            temp_base,
-            target_lang,
-            tts_engine=tts_engine,
-            edge_voice=edge_voice,
-            min_stretch_speed=min_stretch_speed,
-            max_stretch_speed=max_stretch_speed,
-            silence_trim_ms=silence_trim_ms,
-            segment_progress_callback=tts_progress,
-        )
-        dubbed_track.export(dubbed_wav, format="wav")
+            base_audio = AudioSegment.from_wav(extracted_wav)
+            dubbed_track = build_dubbed_track(
+                segments,
+                len(base_audio),
+                temp_base,
+                target_lang,
+                tts_engine=tts_engine,
+                edge_voice=edge_voice,
+                min_stretch_speed=cast(float, resolved_settings["min_stretch_speed"]),
+                max_stretch_speed=cast(float, resolved_settings["max_stretch_speed"]),
+                silence_trim_ms=cast(int, resolved_settings["silence_trim_ms"]),
+                segment_progress_callback=tts_progress,
+                chunk_window_s=cast(float | None, resolved_settings["tts_chunk_window_s"]),
+                cache_dir=tts_cache_dir,
+            )
+            dubbed_track.export(dubbed_wav, format="wav")
 
-        segments_json.write_text(json.dumps([asdict(s) for s in segments], indent=2), encoding="utf-8")
+        save_segments_to_json(segments, segments_json)
 
         report("[5/5] Muxing dubbed audio into video...")
         report_progress(0.92, "Muxing audio and video")
@@ -881,6 +1355,10 @@ def autodub_video(
 
 def main() -> int:
     args = parse_args()
+    glossary_text = ""
+    if args.glossary_file is not None:
+        glossary_text = args.glossary_file.read_text(encoding="utf-8")
+
     return autodub_video(
         input_path=args.input,
         output_path=args.output,
@@ -892,6 +1370,10 @@ def main() -> int:
         start_time_s=args.start_time,
         end_time_s=args.end_time,
         keep_temp=args.keep_temp,
+        optimization_profile=args.optimization_profile,
+        export_srt=not args.no_export_srt,
+        resume_enabled=not args.no_resume,
+        glossary_text=glossary_text,
     )
 
 

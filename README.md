@@ -49,19 +49,21 @@ UI flow:
 
 1. Upload video or paste a YouTube URL.
 2. Pick target language and model/device.
-3. Keep `TTS Engine` on `edge` for more natural neural speech.
-4. Choose an `Edge Voice` (auto-updates when language changes).
-5. Optionally set `Start Time` and `End Time` to dub only a part of the video.
-6. Click **Generate Dubbed Video**.
-7. Watch live progress with ETA while it processes.
-8. Use **Cancel Current Run** if you need to stop processing.
-9. Expand **Advanced Voice Timing Controls** to tune:
-  - Original audio mix level under dubbed speech.
-  - Min/Max stretch speed for timing fit.
-  - Silence trim around synthesized speech segments.
-10. Preview output and read logs.
+3. Use `Optimization Profile`:
+   - `Auto` for normal use
+   - `Short video quality` for clips/songs
+   - `Long video stability` for longer videos
+4. Keep `TTS Engine` on `edge` for more natural neural speech.
+5. Choose an `Edge Voice` (auto-updates when language changes).
+6. Optionally enable:
+   - `Export translated subtitles (.srt)`
+   - `Resume previous job if possible`
+   - `Glossary Overrides` like `death => smrti`
+7. Optionally set `Start Time` and `End Time` to dub only a part of the video.
+8. Click **Generate Dubbed Video**.
+9. Preview output, download the generated `.srt`, and read logs.
 
-Generated videos are saved in `outputs/`.
+Generated videos are saved in `outputs/`, and resume caches are stored under `outputs/.autodub_resume/`.
 
 If using YouTube URL in UI, install:
 
@@ -89,6 +91,10 @@ Optional arguments:
 - `--start-time` start second for dubbing window (default: `0`)
 - `--end-time` optional end second for dubbing window
 - `--keep-temp` keep intermediate files for debugging
+- `--optimization-profile` choose `auto`, `short`, or `long`
+- `--no-export-srt` skip translated `.srt` output
+- `--no-resume` disable resume-cache reuse
+- `--glossary-file` load glossary overrides from a text file
 
 Example with Hindi dubbing:
 

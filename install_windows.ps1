@@ -103,26 +103,25 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Step "Verifying runtime imports"
-& $venvPython -c @"
-import sys
-
-try:
-    import numpy
-    import gradio
-    import deep_translator
-    import faster_whisper
-    import gtts
-    import pydub
-    import tqdm
-    import edge_tts
-    import yt_dlp
-except Exception as exc:
-    print(f"Import check failed: {exc}")
-    sys.exit(1)
-
-print(f"NumPy {numpy.__version__} loaded successfully.")
-print("Python packages look good.")
-"@
+$importCheckCode = @(
+    'import sys'
+    'try:'
+    '    import numpy'
+    '    import gradio'
+    '    import deep_translator'
+    '    import faster_whisper'
+    '    import gtts'
+    '    import pydub'
+    '    import tqdm'
+    '    import edge_tts'
+    '    import yt_dlp'
+    'except Exception as exc:'
+    '    print("Import check failed:", exc)'
+    '    sys.exit(1)'
+    'print("NumPy", numpy.__version__, "loaded successfully.")'
+    'print("Python packages look good.")'
+) -join [Environment]::NewLine
+& $venvPython -c $importCheckCode
 if ($LASTEXITCODE -ne 0) {
     throw "Installed packages failed to import. If needed, delete .venv and run install_windows.bat again."
 }

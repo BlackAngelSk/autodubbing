@@ -27,6 +27,31 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Windows (automatic)
+
+Run either of these from the project folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install_windows.ps1
+```
+
+or just double-click:
+
+```text
+install_windows.bat
+```
+
+This will:
+- install Python and FFmpeg with `winget` when available
+- create `.venv`
+- install everything from `requirements.txt`
+
+Then start the UI with:
+
+```text
+run_ui_windows.bat
+```
+
 Install ffmpeg (Linux):
 
 ```bash

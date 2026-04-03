@@ -46,7 +46,13 @@ This will:
 - create `.venv`
 - install everything from `requirements.txt`
 
-Then start the UI with:
+Then start the UI with either:
+
+```text
+start.bat
+```
+
+or:
 
 ```text
 run_ui_windows.bat

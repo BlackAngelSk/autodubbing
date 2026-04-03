@@ -8,17 +8,20 @@ import asyncio
 import hashlib
 import importlib
 import json
+import logging
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, cast
 
-from deep_translator import GoogleTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 from faster_whisper import WhisperModel
 from gtts import gTTS
 from pydub import AudioSegment
@@ -37,6 +40,103 @@ DEFAULT_EDGE_VOICES: dict[str, str] = {
     "ru": "ru-RU-SvetlanaNeural",
     "sk": "sk-SK-ViktoriaNeural",
 }
+
+LARGE_WHISPER_MODELS = {
+    "large",
+    "large-v1",
+    "large-v2",
+    "large-v3",
+    "large-v3-turbo",
+    "distil-large-v2",
+    "distil-large-v3",
+}
+
+TRANSLATION_PROVIDERS = {"google", "mymemory"}
+HF_UNAUTH_WARNING_TEXT = "You are sending unauthenticated requests to the HF Hub"
+
+
+class _HFUnauthenticatedFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return HF_UNAUTH_WARNING_TEXT not in record.getMessage()
+
+
+def configure_hf_hub_access(hf_token: str | None = None) -> bool:
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*unauthenticated requests to the HF Hub.*",
+        category=UserWarning,
+    )
+
+    for logger_name in ("huggingface_hub", "huggingface_hub.file_download", "huggingface_hub.utils._http"):
+        logger = logging.getLogger(logger_name)
+        if not any(isinstance(existing, _HFUnauthenticatedFilter) for existing in logger.filters):
+            logger.addFilter(_HFUnauthenticatedFilter())
+
+    token = (hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN") or "").strip()
+    if not token:
+        return False
+
+    os.environ["HF_TOKEN"] = token
+    os.environ["HUGGINGFACE_HUB_TOKEN"] = token
+    return True
+
+
+def detect_cuda_available() -> bool:
+    try:
+        ctranslate2 = importlib.import_module("ctranslate2")
+        get_cuda_device_count = getattr(ctranslate2, "get_cuda_device_count", None)
+        if callable(get_cuda_device_count):
+            device_count = get_cuda_device_count()
+            if isinstance(device_count, int):
+                return device_count > 0
+    except Exception:
+        pass
+
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi is None:
+        return False
+
+    try:
+        completed = subprocess.run(
+            [nvidia_smi, "-L"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+    return bool(completed.stdout.strip())
+
+
+def resolve_device_selection(device: str) -> str:
+    return "cuda" if device == "auto" and detect_cuda_available() else ("cpu" if device == "auto" else device)
+
+
+def preferred_whisper_compute_type(model_name: str, device: str) -> str:
+    if device == "cuda":
+        return "float16" if model_name in LARGE_WHISPER_MODELS else "int8_float16"
+    return "int8"
+
+
+def load_whisper_model(model_name: str, device: str, hf_token: str | None = None) -> WhisperModel:
+    has_hf_token = configure_hf_hub_access(hf_token)
+    compute_type = preferred_whisper_compute_type(model_name, device)
+    try:
+        return WhisperModel(model_name, device=device, compute_type=compute_type)
+    except Exception as exc:
+        hint = (
+            "The first run may need to download the model, so check network access and free disk space. "
+            "Set HF_TOKEN for higher rate limits if needed."
+            if model_name in LARGE_WHISPER_MODELS
+            else "Try a smaller model such as 'base' or 'small'."
+        )
+        auth_hint = "" if has_hf_token else " You can also set HF_TOKEN to reduce Hub rate-limit issues."
+        raise RuntimeError(
+            f"Unable to load Whisper model '{model_name}' on '{device}' ({compute_type}). {hint}{auth_hint} Original error: {exc}"
+        ) from exc
 
 
 @dataclass
@@ -70,6 +170,18 @@ def write_srt(segments: Iterable[Segment], srt_path: Path) -> None:
             ]
         )
     srt_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
+def build_translator(provider: str, source: str, target: str) -> Any:
+    normalized = provider.strip().lower() if provider else "google"
+    if normalized not in TRANSLATION_PROVIDERS:
+        raise ValueError(f"Unsupported translation provider: {provider}")
+    if normalized == "mymemory":
+        try:
+            return MyMemoryTranslator(source=source, target=target)
+        except Exception:
+            return GoogleTranslator(source=source, target=target)
+    return GoogleTranslator(source=source, target=target)
 
 
 def parse_glossary_overrides(glossary_text: str | None) -> dict[str, str]:
@@ -125,6 +237,7 @@ def build_resume_dir(
     output_dir: Path,
     target_lang: str,
     whisper_model: str,
+    translation_provider: str,
     tts_engine: str,
     edge_voice: str | None,
     optimization_profile: str,
@@ -137,6 +250,7 @@ def build_resume_dir(
             str(input_path.resolve()),
             target_lang,
             whisper_model,
+            translation_provider,
             tts_engine,
             edge_voice or "",
             optimization_profile,
@@ -221,6 +335,7 @@ def resolve_processing_profile(
         else:
             applied_profile = "balanced"
 
+    resolved_device = resolve_device_selection(device)
     resolved_model = whisper_model
     resolved_min = min_stretch_speed
     resolved_max = max_stretch_speed
@@ -234,7 +349,7 @@ def resolve_processing_profile(
         resolved_trim = max(resolved_trim, 18)
         tts_chunk_window_s = 60.0
     elif applied_profile == "long":
-        if device != "cuda" and whisper_model in {"small", "medium"}:
+        if resolved_device != "cuda" and whisper_model in ({"small", "medium"} | LARGE_WHISPER_MODELS):
             resolved_model = "base"
         resolved_min = min(resolved_min, 0.92)
         resolved_max = max(resolved_max, 1.95)
@@ -247,6 +362,7 @@ def resolve_processing_profile(
 
     return {
         "label": applied_profile,
+        "device": resolved_device,
         "whisper_model": resolved_model,
         "min_stretch_speed": resolved_min,
         "max_stretch_speed": resolved_max,
@@ -291,8 +407,26 @@ def transcribe_segments(
     chunk_length_s: float | None = None,
     cache_dir: Path | None = None,
     chunk_progress_callback: Callable[[int, int], None] | None = None,
+    status_callback: Callable[[str], None] | None = None,
+    hf_token: str | None = None,
 ) -> List[Segment]:
-    model = WhisperModel(model_name, device=device, compute_type="int8")
+    resolved_device = resolve_device_selection(device)
+
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        full_cache_path = cache_dir / f"segments_{model_name}_{resolved_device}.json"
+        if full_cache_path.exists():
+            return load_segments_from_json(full_cache_path)
+    else:
+        full_cache_path = None
+
+    if status_callback is not None:
+        status_callback(
+            f"[whisper] Loading model '{model_name}' on {resolved_device.upper()} "
+            "(first use may download weights)..."
+        )
+
+    model = load_whisper_model(model_name, resolved_device, hf_token=hf_token)
 
     def normalize_text(text: str) -> str:
         lowered = text.strip().lower()
@@ -497,14 +631,6 @@ def transcribe_segments(
         recovered = recover_tail_segments(recall_segments, target_audio_path)
         return merge_tts_friendly_segments(recovered)
 
-    if cache_dir is not None:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        full_cache_path = cache_dir / f"segments_{model_name}_{device}.json"
-        if full_cache_path.exists():
-            return load_segments_from_json(full_cache_path)
-    else:
-        full_cache_path = None
-
     audio_duration_s = len(AudioSegment.from_wav(audio_path)) / 1000.0
     should_chunk = chunk_length_s is not None and audio_duration_s > max(chunk_length_s * 1.15, 90.0)
 
@@ -656,8 +782,8 @@ def split_for_translation(text: str, max_chars: int = 420) -> List[str]:
 
 def safe_translate(
     text: str,
-    translator: GoogleTranslator,
-    fallback_translator: GoogleTranslator,
+    translator: Any,
+    fallback_translator: Any,
 ) -> str:
     """Translate text with retries and chunk fallback to avoid hard pipeline failures."""
     normalized = re.sub(r"\s+", " ", text).strip()
@@ -707,8 +833,12 @@ def safe_translate(
     return normalized
 
 
-def translate_segments(segments: Iterable[Segment], target_lang: str) -> None:
-    translator = GoogleTranslator(source="auto", target=target_lang)
+def translate_segments(
+    segments: Iterable[Segment],
+    target_lang: str,
+    translation_provider: str = "google",
+) -> None:
+    translator = build_translator(translation_provider, source="auto", target=target_lang)
     for seg in tqdm(segments, desc="Translating"):
         seg.translated_text = translator.translate(seg.source_text)
 
@@ -718,10 +848,13 @@ def translate_segments_with_progress(
     target_lang: str,
     segment_progress_callback: Callable[[int, int], None] | None = None,
     glossary_overrides: dict[str, str] | None = None,
+    translation_provider: str = "google",
 ) -> None:
-    translator = GoogleTranslator(source="auto", target=target_lang)
-    fallback_translator = GoogleTranslator(source="en", target=target_lang)
-    word_translator = GoogleTranslator(source="en", target=target_lang)
+    normalized_provider = translation_provider.strip().lower() if translation_provider else "google"
+    translator = build_translator(normalized_provider, source="auto", target=target_lang)
+    fallback_provider = "mymemory" if normalized_provider == "google" else "google"
+    fallback_translator = build_translator(fallback_provider, source="en", target=target_lang)
+    word_translator = build_translator("google", source="en", target=target_lang)
     translation_cache: dict[str, str] = {}
 
     def should_retry_with_english_source(source_text: str, translated_text: str) -> bool:
@@ -799,17 +932,28 @@ def tts_segment(
     edge_voice: str | None = None,
     edge_rate: str = "+0%",
 ) -> None:
+    last_error: Exception | None = None
+
     if tts_engine == "edge":
         voice = edge_voice or DEFAULT_EDGE_VOICES.get(lang, DEFAULT_EDGE_VOICES["en"])
-        try:
-            edge_tts_segment(text, voice, output_mp3, rate=edge_rate)
-            return
-        except Exception:
-            # Fallback keeps pipeline working if Edge service is unavailable.
-            pass
+        for attempt in range(3):
+            try:
+                edge_tts_segment(text, voice, output_mp3, rate=edge_rate)
+                return
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.18 * (attempt + 1))
 
-    tts = gTTS(text=text, lang=lang)
-    tts.save(str(output_mp3))
+    for attempt in range(2):
+        try:
+            tts = gTTS(text=text, lang=lang)
+            tts.save(str(output_mp3))
+            return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.18 * (attempt + 1))
+
+    raise RuntimeError(f"TTS synthesis failed after retries: {last_error}")
 
 
 def sanitize_tts_text(text: str) -> str:
@@ -904,6 +1048,25 @@ def trim_segment_silence(audio: AudioSegment, trim_ms: int) -> AudioSegment:
     return cast(AudioSegment, audio[start:end])
 
 
+def trim_initial_tts_latency(audio: AudioSegment, max_leading_trim_ms: int = 180) -> AudioSegment:
+    """Remove synthetic leading silence so lines start closer to original timing."""
+    if len(audio) <= 0 or max_leading_trim_ms <= 0:
+        return audio
+
+    ranges = detect_nonsilent(audio, min_silence_len=45, silence_thresh=-44)
+    if not ranges:
+        return audio
+
+    lead_ms = max(ranges[0][0], 0)
+    if lead_ms <= 18:
+        return audio
+
+    trim_ms = min(lead_ms, max_leading_trim_ms)
+    if trim_ms >= len(audio):
+        return audio
+    return cast(AudioSegment, audio[trim_ms:])
+
+
 def fit_audio_to_duration_with_controls(
     audio: AudioSegment,
     target_ms: int,
@@ -913,6 +1076,8 @@ def fit_audio_to_duration_with_controls(
     max_stretch_speed: float,
     silence_trim_ms: int,
 ) -> AudioSegment:
+    audio = trim_initial_tts_latency(audio)
+
     if silence_trim_ms > 0:
         audio = trim_segment_silence(audio, silence_trim_ms)
 
@@ -1017,13 +1182,15 @@ def build_dubbed_track(
             if tts_engine == "edge" and slot_ms > 0:
                 natural_ratio = len(voice) / slot_ms
                 if natural_ratio > max_stretch_speed + 0.12:
-                    adaptive_rate = format_edge_rate(int(min((natural_ratio - 1.0) * 28, 18)))
+                    adaptive_rate = format_edge_rate(int(min((natural_ratio - 1.0) * 36, 32)))
                     voice = get_tts_audio(spoken_text, rate=adaptive_rate)
-
-            if len(voice) > slot_ms and i < total:
-                overflow_ms = len(voice) - slot_ms
-                if overflow_ms > 0:
-                    slot_ms = min(slot_ms + min(overflow_ms, 320), total_duration_ms - global_start_ms)
+                    # Some lines still run long after one rate bump. Try one stronger pass
+                    # rather than expanding the segment slot and drifting into the next line.
+                    if len(voice) > slot_ms:
+                        second_ratio = len(voice) / slot_ms
+                        if second_ratio > max_stretch_speed + 0.08:
+                            stronger_rate = format_edge_rate(int(min((second_ratio - 1.0) * 40, 38)))
+                            voice = get_tts_audio(spoken_text, rate=stronger_rate)
 
             voice = fit_audio_to_duration_with_controls(
                 voice,
@@ -1110,6 +1277,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-lang", required=True, help="Target language code, e.g. es, hi, fr")
     parser.add_argument("--whisper-model", default="small", help="faster-whisper model size")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Inference device")
+    parser.add_argument(
+        "--translation-provider",
+        default="google",
+        choices=["google", "mymemory"],
+        help="Translation backend to use",
+    )
+    parser.add_argument(
+        "--hf-token",
+        default=None,
+        help="Optional Hugging Face token for faster Whisper model downloads and higher rate limits",
+    )
     parser.add_argument("--tts-engine", default="edge", choices=["edge", "gtts"], help="Speech synthesis engine")
     parser.add_argument("--edge-voice", default=None, help="Edge voice name, e.g. en-US-AriaNeural")
     parser.add_argument("--start-time", type=float, default=0.0, help="Start time in seconds for dubbing window")
@@ -1118,7 +1296,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--optimization-profile",
         default="auto",
-        choices=["auto", "short", "long"],
+        choices=["auto", "balanced", "short", "long"],
         help="Auto-tune settings for short or long videos",
     )
     parser.add_argument("--no-export-srt", action="store_true", help="Skip translated subtitle export")
@@ -1138,6 +1316,8 @@ def autodub_video(
     target_lang: str,
     whisper_model: str = "small",
     device: str = "auto",
+    translation_provider: str = "google",
+    hf_token: str | None = None,
     tts_engine: str = "edge",
     edge_voice: str | None = None,
     background_mix_level: float = 0.08,
@@ -1165,6 +1345,7 @@ def autodub_video(
             bounded = min(max(value, 0.0), 1.0)
             progress_percent_callback(bounded, label)
 
+    has_hf_token = configure_hf_hub_access(hf_token)
     ensure_ffmpeg()
 
     if not input_path.exists():
@@ -1189,6 +1370,7 @@ def autodub_video(
                 output_dir=output_path.parent,
                 target_lang=target_lang,
                 whisper_model=whisper_model,
+                translation_provider=translation_provider,
                 tts_engine=tts_engine,
                 edge_voice=edge_voice,
                 optimization_profile=optimization_profile,
@@ -1234,8 +1416,15 @@ def autodub_video(
         report(
             "[opt] "
             f"Profile={resolved_settings['label']} | clip={clip_label} | "
-            f"Whisper={resolved_settings['whisper_model']}"
+            f"Device={resolved_settings['device']} | Whisper={resolved_settings['whisper_model']} | "
+            f"Translate={translation_provider}"
         )
+        if cast(str, resolved_settings["whisper_model"]) in LARGE_WHISPER_MODELS:
+            report("[whisper] Large models may download several GB on first use.")
+            if not has_hf_token:
+                report("[hf] Optional: set `HF_TOKEN` or use the UI token field for higher rate limits and faster downloads.")
+        if cast(str, resolved_settings["device"]) != "cuda" and cast(str, resolved_settings["whisper_model"]) in LARGE_WHISPER_MODELS:
+            report("[hw] Large Whisper on CPU can be slow; use CUDA or switch to 'medium' for faster runs.")
 
         report("[1/5] Extracting audio...")
         if extracted_wav.exists():
@@ -1263,10 +1452,12 @@ def autodub_video(
             segments = transcribe_segments(
                 extracted_wav,
                 cast(str, resolved_settings["whisper_model"]),
-                device,
+                cast(str, resolved_settings["device"]),
                 chunk_length_s=cast(float | None, resolved_settings["transcribe_chunk_s"]),
                 cache_dir=asr_cache_dir,
                 chunk_progress_callback=asr_chunk_progress,
+                status_callback=report,
+                hf_token=hf_token,
             )
             save_segments_to_json(segments, segments_json)
             report_progress(0.35, f"Transcription complete ({len(segments)} segments)")
@@ -1292,6 +1483,7 @@ def autodub_video(
                 target_lang,
                 segment_progress_callback=translation_progress,
                 glossary_overrides=glossary_overrides,
+                translation_provider=translation_provider,
             )
             save_segments_to_json(segments, segments_json)
         else:
@@ -1365,6 +1557,8 @@ def main() -> int:
         target_lang=args.target_lang,
         whisper_model=args.whisper_model,
         device=args.device,
+        translation_provider=args.translation_provider,
+        hf_token=args.hf_token,
         tts_engine=args.tts_engine,
         edge_voice=args.edge_voice,
         start_time_s=args.start_time,

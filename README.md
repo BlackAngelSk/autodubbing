@@ -27,6 +27,12 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Optional for faster Whisper model downloads and to avoid the HF Hub auth warning:
+
+```bash
+export HF_TOKEN=hf_your_token_here
+```
+
 ### Windows (automatic)
 
 Run either of these from the project folder:
@@ -64,6 +70,12 @@ Install ffmpeg (Linux):
 sudo apt-get update && sudo apt-get install -y ffmpeg
 ```
 
+Quick start on Linux/macOS:
+
+```bash
+bash ./run_ui_unix.sh
+```
+
 ## Usage
 
 ### Web UI (Recommended)
@@ -79,20 +91,23 @@ Then open the local URL shown in terminal (usually `http://127.0.0.1:7860`).
 UI flow:
 
 1. Upload video or paste a YouTube URL.
-2. Pick target language and model/device.
-3. Use `Optimization Profile`:
+2. Pick a `Quality Preset` (`Fast`, `Balanced`, or `Best Quality`).
+3. Choose target language and, if needed, manually override the Whisper model/device.
+4. Use `Optimization Profile`:
    - `Auto` for normal use
+   - `Balanced` for manual middle-ground control
    - `Short video quality` for clips/songs
    - `Long video stability` for longer videos
-4. Keep `TTS Engine` on `edge` for more natural neural speech.
-5. Choose an `Edge Voice` (auto-updates when language changes).
-6. Optionally enable:
+5. Keep `TTS Engine` on `edge` for more natural neural speech.
+6. Optionally switch `Translation Provider` between `Google` and `MyMemory`.
+7. Choose an `Edge Voice` (auto-updates when language changes).
+8. Optionally enable:
    - `Export translated subtitles (.srt)`
    - `Resume previous job if possible`
    - `Glossary Overrides` like `death => smrti`
-7. Optionally set `Start Time` and `End Time` to dub only a part of the video.
-8. Click **Generate Dubbed Video**.
-9. Preview output, download the generated `.srt`, and read logs.
+9. Optionally set `Start Time` and `End Time` to dub only a part of the video.
+10. Click **Generate Dubbed Video**.
+11. Preview output, download the generated `.srt`, and read logs.
 
 Generated videos are saved in `outputs/`, and resume caches are stored under `outputs/.autodub_resume/`.
 
@@ -115,14 +130,16 @@ python autodub.py \
 
 Optional arguments:
 
-- `--whisper-model` (default: `small`)
+- `--whisper-model` (default: `small`) options include `tiny`, `base`, `small`, `medium`, `large-v2`, `large-v3`, `large-v3-turbo`, `distil-large-v3`
 - `--device` (default: `auto`) values: `auto`, `cpu`, `cuda`
+- `--translation-provider` values: `google` (default), `mymemory`
+- `--hf-token` optional Hugging Face token for authenticated Whisper model downloads
 - `--tts-engine` values: `edge` (default), `gtts`
 - `--edge-voice` custom voice, example: `en-US-AriaNeural`
 - `--start-time` start second for dubbing window (default: `0`)
 - `--end-time` optional end second for dubbing window
 - `--keep-temp` keep intermediate files for debugging
-- `--optimization-profile` choose `auto`, `short`, or `long`
+- `--optimization-profile` choose `auto`, `balanced`, `short`, or `long`
 - `--no-export-srt` skip translated `.srt` output
 - `--no-resume` disable resume-cache reuse
 - `--glossary-file` load glossary overrides from a text file
@@ -160,6 +177,10 @@ If `--keep-temp` is passed, the script will show the temp directory path so you 
 ## Troubleshooting
 
 - If transcription is slow, try `--whisper-model base`.
+- For best transcription quality on a capable GPU, try `--whisper-model large-v3`.
+- The first run of larger Whisper models may download several GB of weights.
+- If you see an HF Hub unauthenticated warning, set `HF_TOKEN` in your shell or paste it into the UI's optional token field.
+- If one translation service struggles, switch the UI or CLI to `mymemory` and retry.
 - If translation fails for some segments, retry later (service/network issue).
 - If voices sound too fast/slow, edit `fit_audio_to_duration` logic in `autodub.py`.
 - For more natural speech, use `edge` engine and a voice matching your target language.

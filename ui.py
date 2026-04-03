@@ -13,7 +13,7 @@ from time import perf_counter
 
 import gradio as gr
 
-from autodub import DEFAULT_EDGE_VOICES, autodub_video
+from autodub import DEFAULT_EDGE_VOICES, autodub_video, detect_cuda_available
 
 
 LANGUAGE_CHOICES = [
@@ -41,13 +41,114 @@ EDGE_VOICE_CHOICES = [
     ("Slovak - Viktoria (sk-SK-ViktoriaNeural)", "sk-SK-ViktoriaNeural"),
 ]
 
+WHISPER_MODEL_CHOICES = [
+    ("tiny (fastest)", "tiny"),
+    ("base", "base"),
+    ("small", "small"),
+    ("medium", "medium"),
+    ("large-v2", "large-v2"),
+    ("large-v3 (best accuracy, GPU recommended)", "large-v3"),
+    ("large-v3-turbo (faster high quality)", "large-v3-turbo"),
+    ("distil-large-v3 (fast large model)", "distil-large-v3"),
+]
+
+QUALITY_PRESET_CHOICES = [
+    ("Fast", "fast"),
+    ("Balanced", "balanced"),
+    ("Best Quality", "best"),
+]
+
+TRANSLATION_PROVIDER_CHOICES = [
+    ("Google", "google"),
+    ("MyMemory", "mymemory"),
+]
+
+LARGE_WHISPER_MODELS = {"large-v2", "large-v3", "large-v3-turbo", "distil-large-v3"}
+AUTO_DEVICE = "cuda" if detect_cuda_available() else "cpu"
+
 
 def voice_for_language(lang: str) -> str:
     return DEFAULT_EDGE_VOICES.get(lang, DEFAULT_EDGE_VOICES["en"])
 
 
-def on_language_change(lang: str) -> gr.Dropdown:
-    return gr.Dropdown(value=voice_for_language(lang))
+def build_runtime_note(
+    whisper_model: str,
+    device: str,
+    optimization_profile: str,
+    tts_engine: str,
+) -> str:
+    resolved_device = AUTO_DEVICE if device == "auto" else device
+    speed_label = "fast" if whisper_model in {"tiny", "base"} else "balanced" if whisper_model in {"small", "medium", "distil-large-v3"} else "slowest"
+
+    lines = [
+        f"Auto-detected hardware target: `{AUTO_DEVICE}`.",
+        f"Expected transcription pace: **{speed_label}**.",
+        f"Optimization profile: `{optimization_profile}`.",
+    ]
+    if whisper_model in LARGE_WHISPER_MODELS:
+        lines.append("First use of this model may download several GB of Whisper weights.")
+        lines.append("Optional: set `HF_TOKEN` or paste a Hugging Face token below to avoid the auth warning and improve rate limits.")
+    if resolved_device != "cuda" and whisper_model in LARGE_WHISPER_MODELS:
+        lines.append("Large Whisper models on CPU can take a long time; `medium` is usually the safer fallback.")
+    if tts_engine != "edge":
+        lines.append("`gtts` is simpler but usually sounds less natural than `edge`.")
+
+    return "### Smart guidance\n" + "\n".join(f"- {line}" for line in lines)
+
+
+def on_language_change(lang: str, tts_engine: str) -> gr.Dropdown:
+    return gr.Dropdown(
+        choices=EDGE_VOICE_CHOICES,
+        value=voice_for_language(lang),
+        interactive=tts_engine == "edge",
+    )
+
+
+def on_tts_engine_change(tts_engine: str, lang: str) -> gr.Dropdown:
+    return gr.Dropdown(
+        choices=EDGE_VOICE_CHOICES,
+        value=voice_for_language(lang),
+        interactive=tts_engine == "edge",
+    )
+
+
+def on_quality_preset_change(preset: str, tts_engine: str) -> tuple[gr.Dropdown, gr.Dropdown, gr.Radio, gr.Markdown]:
+    if preset == "fast":
+        whisper_value = "base"
+        profile_value = "long"
+        device_value = "auto"
+    elif preset == "best":
+        whisper_value = "large-v3"
+        profile_value = "short"
+        device_value = "cuda" if AUTO_DEVICE == "cuda" else "auto"
+    else:
+        whisper_value = "small"
+        profile_value = "auto"
+        device_value = "auto"
+
+    return (
+        gr.Dropdown(choices=WHISPER_MODEL_CHOICES, value=whisper_value),
+        gr.Dropdown(
+            choices=[
+                ("Auto (recommended)", "auto"),
+                ("Balanced", "balanced"),
+                ("Short video quality", "short"),
+                ("Long video stability", "long"),
+            ],
+            value=profile_value,
+        ),
+        gr.Radio(choices=["auto", "cpu", "cuda"], value=device_value),
+        gr.Markdown(value=build_runtime_note(whisper_value, device_value, profile_value, tts_engine)),
+    )
+
+
+def on_settings_change(
+    whisper_model: str,
+    device: str,
+    optimization_profile: str,
+    tts_engine: str,
+) -> gr.Markdown:
+    return gr.Markdown(value=build_runtime_note(whisper_model, device, optimization_profile, tts_engine))
 
 
 def parse_optional_number(value: object, *, default: float | None) -> float | None:
@@ -77,6 +178,8 @@ def run_dub(
     optimization_profile: str,
     tts_engine: str,
     edge_voice: str,
+    translation_provider: str,
+    hf_token: str,
     export_srt: bool,
     resume_enabled: bool,
     glossary_text: str,
@@ -187,6 +290,8 @@ def run_dub(
             whisper_model=whisper_model,
             device=device,
             optimization_profile=optimization_profile,
+            translation_provider=translation_provider,
+            hf_token=hf_token.strip() or None,
             tts_engine=tts_engine,
             edge_voice=edge_voice if tts_engine == "edge" else None,
             export_srt=export_srt,
@@ -230,6 +335,13 @@ Upload a video, choose target language, and generate a dubbed version.
                 run_button = gr.Button("2) Generate Dubbed Video", variant="primary")
             with gr.Column(scale=1):
                 gr.Markdown("### 3) Settings")
+                quality_preset = gr.Radio(
+                    label="Quality Preset",
+                    choices=QUALITY_PRESET_CHOICES,
+                    value="balanced",
+                    info="Quickly choose fast, balanced, or best-quality defaults",
+                )
+                hardware_hint = gr.Markdown(build_runtime_note("small", "auto", "auto", "edge"))
                 target_lang = gr.Dropdown(
                     label="Target Language",
                     choices=LANGUAGE_CHOICES,
@@ -238,14 +350,21 @@ Upload a video, choose target language, and generate a dubbed version.
                 )
                 whisper_model = gr.Dropdown(
                     label="Whisper Model",
-                    choices=["tiny", "base", "small", "medium"],
+                    choices=WHISPER_MODEL_CHOICES,
                     value="small",
+                    info="Larger models are more accurate; `large-v3` is best on GPU",
                 )
-                device = gr.Radio(label="Device", choices=["auto", "cpu", "cuda"], value="auto")
+                device = gr.Radio(
+                    label="Device",
+                    choices=["auto", "cpu", "cuda"],
+                    value="auto",
+                    info=f"Auto currently resolves to {AUTO_DEVICE} on this machine",
+                )
                 optimization_profile = gr.Dropdown(
                     label="Optimization Profile",
                     choices=[
                         ("Auto (recommended)", "auto"),
+                        ("Balanced", "balanced"),
                         ("Short video quality", "short"),
                         ("Long video stability", "long"),
                     ],
@@ -262,6 +381,18 @@ Upload a video, choose target language, and generate a dubbed version.
                     label="Edge Voice",
                     choices=EDGE_VOICE_CHOICES,
                     value=voice_for_language("es"),
+                )
+                translation_provider = gr.Radio(
+                    label="Translation Provider",
+                    choices=TRANSLATION_PROVIDER_CHOICES,
+                    value="google",
+                    info="Google is the default; MyMemory is a good alternate when needed",
+                )
+                hf_token = gr.Textbox(
+                    label="Hugging Face Token (optional)",
+                    type="password",
+                    placeholder="hf_...",
+                    info="Avoids the HF Hub auth warning and can improve Whisper download rate limits",
                 )
                 export_srt = gr.Checkbox(
                     label="Export translated subtitles (.srt)",
@@ -298,7 +429,33 @@ Upload a video, choose target language, and generate a dubbed version.
                     )
                 keep_temp = gr.Checkbox(label="Keep temp files", value=False)
 
-        target_lang.change(fn=on_language_change, inputs=[target_lang], outputs=[edge_voice])
+        target_lang.change(fn=on_language_change, inputs=[target_lang, tts_engine], outputs=[edge_voice])
+        tts_engine.change(fn=on_tts_engine_change, inputs=[tts_engine, target_lang], outputs=[edge_voice])
+        quality_preset.change(
+            fn=on_quality_preset_change,
+            inputs=[quality_preset, tts_engine],
+            outputs=[whisper_model, optimization_profile, device, hardware_hint],
+        )
+        whisper_model.change(
+            fn=on_settings_change,
+            inputs=[whisper_model, device, optimization_profile, tts_engine],
+            outputs=[hardware_hint],
+        )
+        device.change(
+            fn=on_settings_change,
+            inputs=[whisper_model, device, optimization_profile, tts_engine],
+            outputs=[hardware_hint],
+        )
+        optimization_profile.change(
+            fn=on_settings_change,
+            inputs=[whisper_model, device, optimization_profile, tts_engine],
+            outputs=[hardware_hint],
+        )
+        tts_engine.change(
+            fn=on_settings_change,
+            inputs=[whisper_model, device, optimization_profile, tts_engine],
+            outputs=[hardware_hint],
+        )
 
         with gr.Row():
             output_video = gr.Video(label="4) Dubbed Output")
@@ -318,6 +475,8 @@ Upload a video, choose target language, and generate a dubbed version.
                 optimization_profile,
                 tts_engine,
                 edge_voice,
+                translation_provider,
+                hf_token,
                 export_srt,
                 resume_enabled,
                 glossary_text,

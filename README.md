@@ -164,5 +164,6 @@ If `--keep-temp` is passed, the script will show the temp directory path so you 
 - If voices sound too fast/slow, edit `fit_audio_to_duration` logic in `autodub.py`.
 - For more natural speech, use `edge` engine and a voice matching your target language.
 - If the UI does not open, check that Gradio installed successfully: `pip install -r requirements.txt`.
+- On older Windows CPUs, use `install_windows.bat` or `start.bat` so a compatible `numpy==1.26.4` build is installed automatically.
 - If YouTube download fails, update downloader: `pip install -U yt-dlp`.
 - If a YouTube link still fails, try a direct watch URL (not playlist/channel links).

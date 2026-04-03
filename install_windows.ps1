@@ -88,31 +88,44 @@ if (-not (Test-Path $venvPython)) {
 
 Write-Step "Upgrading pip tools"
 & $venvPython -m pip install --upgrade pip setuptools wheel
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to upgrade pip tools."
+}
 
 Write-Step "Installing Python requirements"
+& $venvPython -m pip install --upgrade --force-reinstall "numpy==1.26.4"
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to install the Windows-compatible NumPy build."
+}
 & $venvPython -m pip install -r (Join-Path $RepoRoot "requirements.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to install Python requirements."
+}
 
-Write-Step "Verifying key Python modules"
+Write-Step "Verifying runtime imports"
 & $venvPython -c @"
-import importlib.util
 import sys
 
-modules = [
-    "gradio",
-    "deep_translator",
-    "faster_whisper",
-    "gtts",
-    "pydub",
-    "tqdm",
-    "edge_tts",
-    "yt_dlp",
-]
-missing = [name for name in modules if importlib.util.find_spec(name) is None]
-if missing:
-    print("Missing modules:", ", ".join(missing))
+try:
+    import numpy
+    import gradio
+    import deep_translator
+    import faster_whisper
+    import gtts
+    import pydub
+    import tqdm
+    import edge_tts
+    import yt_dlp
+except Exception as exc:
+    print(f"Import check failed: {exc}")
     sys.exit(1)
+
+print(f"NumPy {numpy.__version__} loaded successfully.")
 print("Python packages look good.")
 "@
+if ($LASTEXITCODE -ne 0) {
+    throw "Installed packages failed to import. If needed, delete .venv and run install_windows.bat again."
+}
 
 if (-not (Test-Command "ffmpeg")) {
     Write-Warning "ffmpeg is still not on PATH. Install it manually if video processing fails."

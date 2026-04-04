@@ -52,12 +52,12 @@ LARGE_WHISPER_MODELS = {
 }
 
 TRANSLATION_PROVIDERS = {"google", "mymemory"}
-HF_UNAUTH_WARNING_TEXT = "You are sending unauthenticated requests to the HF Hub"
+HF_UNAUTH_WARNING_TEXT = "unauthenticated requests to the hf hub"
 
 
 class _HFUnauthenticatedFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        return HF_UNAUTH_WARNING_TEXT not in record.getMessage()
+        return HF_UNAUTH_WARNING_TEXT not in record.getMessage().lower()
 
 
 def configure_hf_hub_access(hf_token: str | None = None) -> bool:
@@ -67,7 +67,13 @@ def configure_hf_hub_access(hf_token: str | None = None) -> bool:
         category=UserWarning,
     )
 
-    for logger_name in ("huggingface_hub", "huggingface_hub.file_download", "huggingface_hub.utils._http"):
+    for logger_name in (
+        "",
+        "huggingface_hub",
+        "huggingface_hub.file_download",
+        "huggingface_hub.utils._http",
+        "huggingface_hub.utils._validators",
+    ):
         logger = logging.getLogger(logger_name)
         if not any(isinstance(existing, _HFUnauthenticatedFilter) for existing in logger.filters):
             logger.addFilter(_HFUnauthenticatedFilter())
@@ -79,6 +85,16 @@ def configure_hf_hub_access(hf_token: str | None = None) -> bool:
     os.environ["HF_TOKEN"] = token
     os.environ["HUGGINGFACE_HUB_TOKEN"] = token
     return True
+
+
+def configure_windows_asyncio_policy() -> None:
+    """Use selector policy on Windows to avoid noisy Proactor transport shutdown errors."""
+    if os.name != "nt" or not hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+        return
+
+    current_policy = asyncio.get_event_loop_policy()
+    if not isinstance(current_policy, asyncio.WindowsSelectorEventLoopPolicy):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 def detect_cuda_available() -> bool:
@@ -121,12 +137,39 @@ def preferred_whisper_compute_type(model_name: str, device: str) -> str:
     return "int8"
 
 
+def is_cuda_runtime_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    markers = (
+        "cublas",
+        "cublas64",
+        "cudnn",
+        "cudart",
+        "nvcuda",
+        "cuda driver",
+        "cannot be loaded",
+        "failed to load",
+    )
+    return any(marker in message for marker in markers)
+
+
 def load_whisper_model(model_name: str, device: str, hf_token: str | None = None) -> WhisperModel:
     has_hf_token = configure_hf_hub_access(hf_token)
     compute_type = preferred_whisper_compute_type(model_name, device)
     try:
         return WhisperModel(model_name, device=device, compute_type=compute_type)
     except Exception as exc:
+        if device == "cuda" and is_cuda_runtime_error(exc):
+            cpu_compute_type = preferred_whisper_compute_type(model_name, "cpu")
+            logging.warning(
+                "CUDA runtime libraries are unavailable (%s). Falling back to CPU for Whisper model '%s'.",
+                exc,
+                model_name,
+            )
+            try:
+                return WhisperModel(model_name, device="cpu", compute_type=cpu_compute_type)
+            except Exception:
+                pass
+
         hint = (
             "The first run may need to download the model, so check network access and free disk space. "
             "Set HF_TOKEN for higher rate limits if needed."
@@ -916,10 +959,22 @@ def translate_segments_with_progress(
 
 def edge_tts_segment(text: str, voice: str, output_mp3: Path, rate: str = "+0%") -> None:
     edge_tts = importlib.import_module("edge_tts")
+    configure_windows_asyncio_policy()
 
     async def synthesize() -> None:
         communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate)
         await communicate.save(str(output_mp3))
+
+    if os.name == "nt" and hasattr(asyncio, "SelectorEventLoop"):
+        loop = asyncio.SelectorEventLoop()
+        try:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(synthesize())
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+        return
 
     asyncio.run(synthesize())
 

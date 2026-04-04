@@ -23,8 +23,17 @@ It also includes a web UI for easier navigation.
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+Activate the virtual environment based on your shell:
+
+```bash
+# bash/zsh
+source .venv/bin/activate
+
+# fish
+source .venv/bin/activate.fish
 ```
 
 Optional for faster Whisper model downloads and to avoid the HF Hub auth warning:
@@ -74,6 +83,22 @@ Quick start on Linux/macOS:
 
 ```bash
 bash ./run_ui_unix.sh
+```
+
+## Auto Update
+
+Update to the latest version and refresh dependencies:
+
+Linux/macOS:
+
+```bash
+bash ./update_unix.sh
+```
+
+Windows:
+
+```text
+update_windows.bat
 ```
 
 ## Usage

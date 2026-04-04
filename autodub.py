@@ -484,6 +484,7 @@ def transcribe_segments(
     hf_token: str | None = None,
 ) -> List[Segment]:
     resolved_device = resolve_device_selection(device)
+    active_device = resolved_device
 
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -603,6 +604,8 @@ def transcribe_segments(
         return merged
 
     def collect_segments(target_audio_path: Path, vad_filter: bool, relaxed: bool = False) -> List[Segment]:
+        nonlocal model, active_device
+
         transcribe_kwargs: dict[str, Any] = {
             "vad_filter": vad_filter,
             "word_timestamps": True,
@@ -612,10 +615,30 @@ def transcribe_segments(
             # Favor recall for quiet/overlapped speech in the second pass.
             transcribe_kwargs["no_speech_threshold"] = 0.92
 
-        whisper_segments, _info = model.transcribe(
-            str(target_audio_path),
-            **transcribe_kwargs,
-        )
+        try:
+            whisper_segments, _info = model.transcribe(
+                str(target_audio_path),
+                **transcribe_kwargs,
+            )
+        except Exception as exc:
+            if active_device == "cuda" and is_cuda_runtime_error(exc):
+                if status_callback is not None:
+                    status_callback(
+                        "[whisper] CUDA runtime became unavailable during transcription. Retrying on CPU..."
+                    )
+                logging.warning(
+                    "Whisper CUDA transcription failed (%s). Retrying with CPU.",
+                    exc,
+                )
+                active_device = "cpu"
+                model = load_whisper_model(model_name, "cpu", hf_token=hf_token)
+                whisper_segments, _info = model.transcribe(
+                    str(target_audio_path),
+                    **transcribe_kwargs,
+                )
+            else:
+                raise
+
         collected: List[Segment] = []
         for seg in whisper_segments:
             text = seg.text.strip()

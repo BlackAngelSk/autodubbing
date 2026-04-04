@@ -97,6 +97,36 @@ def configure_windows_asyncio_policy() -> None:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
+def suppress_windows_proactor_connection_reset_noise() -> None:
+    """Suppress known benign WinError 10054 noise from Proactor shutdown callbacks."""
+    if os.name != "nt":
+        return
+
+    if getattr(asyncio, "_autodub_proactor_reset_patch", False):
+        return
+
+    original_handler = asyncio.BaseEventLoop.default_exception_handler
+
+    def patched_default_exception_handler(self: asyncio.BaseEventLoop, context: dict[str, Any]) -> None:
+        exc = context.get("exception")
+        handle = context.get("handle")
+        callback_text = repr(handle) if handle is not None else str(context.get("message", ""))
+        if (
+            isinstance(exc, ConnectionResetError)
+            and "winerror 10054" in str(exc).lower()
+            and "_proactorbasepipetransport._call_connection_lost" in callback_text.lower()
+        ):
+            return
+        original_handler(self, context)
+
+    asyncio.BaseEventLoop.default_exception_handler = patched_default_exception_handler
+    setattr(asyncio, "_autodub_proactor_reset_patch", True)
+
+
+configure_windows_asyncio_policy()
+suppress_windows_proactor_connection_reset_noise()
+
+
 def detect_cuda_available() -> bool:
     try:
         ctranslate2 = importlib.import_module("ctranslate2")

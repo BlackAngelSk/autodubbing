@@ -127,6 +127,7 @@ UI flow:
 6. Optionally switch `Translation Provider` between `Google` and `MyMemory`.
 7. Choose an `Edge Voice` (auto-updates when language changes).
 8. Optionally enable:
+   - `Keep original audio quietly in background` (turn off for dubbed voice only)
    - `Export translated subtitles (.srt)`
    - `Resume previous job if possible`
    - `Glossary Overrides` like `death => smrti`
@@ -164,6 +165,7 @@ Optional arguments:
 - `--start-time` start second for dubbing window (default: `0`)
 - `--end-time` optional end second for dubbing window
 - `--keep-temp` keep intermediate files for debugging
+- `--disable-original-audio` output dubbed speech only (no original source audio mixed in)
 - `--optimization-profile` choose `auto`, `balanced`, `short`, or `long`
 - `--no-export-srt` skip translated `.srt` output
 - `--no-resume` disable resume-cache reuse
@@ -207,9 +209,11 @@ If `--keep-temp` is passed, the script will show the temp directory path so you 
 - If you see an HF Hub unauthenticated warning, set `HF_TOKEN` in your shell or paste it into the UI's optional token field.
 - If one translation service struggles, switch the UI or CLI to `mymemory` and retry.
 - If translation fails for some segments, retry later (service/network issue).
+- Translation now runs with bounded parallel workers for longer jobs to improve speed while keeping provider load controlled.
 - If voices sound too fast/slow, edit `fit_audio_to_duration` logic in `autodub.py`.
 - For more natural speech, use `edge` engine and a voice matching your target language.
 - If the UI does not open, check that Gradio installed successfully: `pip install -r requirements.txt`.
 - On older Windows CPUs, use `install_windows.bat` or `start.bat` so a compatible `numpy==1.26.4` build is installed automatically.
+- If you have an NVIDIA GPU but runs still use CPU, set `--device cuda` explicitly and update GPU dependencies (`faster-whisper`/`ctranslate2` + CUDA runtime libs). The loader now tries multiple CUDA compute modes automatically.
 - If YouTube download fails, update downloader: `pip install -U yt-dlp`.
 - If a YouTube link still fails, try a direct watch URL (not playlist/channel links).

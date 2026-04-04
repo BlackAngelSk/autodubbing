@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import importlib
 import json
@@ -167,6 +168,22 @@ def preferred_whisper_compute_type(model_name: str, device: str) -> str:
     return "int8"
 
 
+def whisper_compute_type_candidates(model_name: str, device: str) -> list[str]:
+    preferred = preferred_whisper_compute_type(model_name, device)
+    if device == "cuda":
+        # Different NVIDIA generations and driver/runtime combos can prefer
+        # different compute modes, so try a short fallback chain on GPU first.
+        candidates = [preferred, "float16", "int8_float16", "int8"]
+    else:
+        candidates = [preferred, "int8", "float32"]
+
+    ordered: list[str] = []
+    for compute in candidates:
+        if compute not in ordered:
+            ordered.append(compute)
+    return ordered
+
+
 def is_cuda_runtime_error(exc: Exception) -> bool:
     message = str(exc).lower()
     markers = (
@@ -182,34 +199,60 @@ def is_cuda_runtime_error(exc: Exception) -> bool:
     return any(marker in message for marker in markers)
 
 
-def load_whisper_model(model_name: str, device: str, hf_token: str | None = None) -> WhisperModel:
-    has_hf_token = configure_hf_hub_access(hf_token)
-    compute_type = preferred_whisper_compute_type(model_name, device)
-    try:
-        return WhisperModel(model_name, device=device, compute_type=compute_type)
-    except Exception as exc:
-        if device == "cuda" and is_cuda_runtime_error(exc):
-            cpu_compute_type = preferred_whisper_compute_type(model_name, "cpu")
-            logging.warning(
-                "CUDA runtime libraries are unavailable (%s). Falling back to CPU for Whisper model '%s'.",
-                exc,
-                model_name,
-            )
-            try:
-                return WhisperModel(model_name, device="cpu", compute_type=cpu_compute_type)
-            except Exception:
-                pass
+def cpu_fallback_whisper_model(model_name: str) -> str:
+    """Pick a faster model when CUDA is unavailable and we must run on CPU."""
+    normalized = model_name.strip().lower()
+    if normalized in LARGE_WHISPER_MODELS:
+        return "small"
+    if normalized == "medium":
+        return "small"
+    return model_name
 
-        hint = (
-            "The first run may need to download the model, so check network access and free disk space. "
-            "Set HF_TOKEN for higher rate limits if needed."
-            if model_name in LARGE_WHISPER_MODELS
-            else "Try a smaller model such as 'base' or 'small'."
+
+def load_whisper_model(
+    model_name: str,
+    device: str,
+    hf_token: str | None = None,
+    cpu_fallback_model: str | None = None,
+) -> WhisperModel:
+    has_hf_token = configure_hf_hub_access(hf_token)
+    attempted_compute_types = whisper_compute_type_candidates(model_name, device)
+    last_error: Exception | None = None
+
+    for compute_type in attempted_compute_types:
+        try:
+            return WhisperModel(model_name, device=device, compute_type=compute_type)
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    if device == "cuda" and last_error is not None and is_cuda_runtime_error(last_error):
+        fallback_model = cpu_fallback_model or cpu_fallback_whisper_model(model_name)
+        cpu_compute_candidates = whisper_compute_type_candidates(fallback_model, "cpu")
+        logging.info(
+            "CUDA runtime libraries are unavailable (%s). Falling back to CPU for Whisper model '%s'.",
+            last_error,
+            fallback_model,
         )
-        auth_hint = "" if has_hf_token else " You can also set HF_TOKEN to reduce Hub rate-limit issues."
-        raise RuntimeError(
-            f"Unable to load Whisper model '{model_name}' on '{device}' ({compute_type}). {hint}{auth_hint} Original error: {exc}"
-        ) from exc
+        for cpu_compute_type in cpu_compute_candidates:
+            try:
+                return WhisperModel(fallback_model, device="cpu", compute_type=cpu_compute_type)
+            except Exception as exc:
+                last_error = exc
+                continue
+
+    hint = (
+        "The first run may need to download the model, so check network access and free disk space. "
+        "Set HF_TOKEN for higher rate limits if needed."
+        if model_name in LARGE_WHISPER_MODELS
+        else "Try a smaller model such as 'base' or 'small'."
+    )
+    auth_hint = "" if has_hf_token else " You can also set HF_TOKEN to reduce Hub rate-limit issues."
+    attempted = ", ".join(attempted_compute_types)
+    raise RuntimeError(
+        f"Unable to load Whisper model '{model_name}' on '{device}'. "
+        f"Tried compute types: {attempted}. {hint}{auth_hint} Original error: {last_error}"
+    ) from last_error
 
 
 @dataclass
@@ -485,6 +528,7 @@ def transcribe_segments(
 ) -> List[Segment]:
     resolved_device = resolve_device_selection(device)
     active_device = resolved_device
+    active_model_name = model_name
 
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -500,7 +544,12 @@ def transcribe_segments(
             "(first use may download weights)..."
         )
 
-    model = load_whisper_model(model_name, resolved_device, hf_token=hf_token)
+    model = load_whisper_model(
+        model_name,
+        resolved_device,
+        hf_token=hf_token,
+        cpu_fallback_model=cpu_fallback_whisper_model(model_name),
+    )
 
     def normalize_text(text: str) -> str:
         lowered = text.strip().lower()
@@ -604,12 +653,14 @@ def transcribe_segments(
         return merged
 
     def collect_segments(target_audio_path: Path, vad_filter: bool, relaxed: bool = False) -> List[Segment]:
-        nonlocal model, active_device
+        nonlocal model, active_device, active_model_name
 
         transcribe_kwargs: dict[str, Any] = {
             "vad_filter": vad_filter,
             "word_timestamps": True,
             "condition_on_previous_text": False,
+            "beam_size": 1,
+            "best_of": 1,
         }
         if relaxed:
             # Favor recall for quiet/overlapped speech in the second pass.
@@ -622,16 +673,19 @@ def transcribe_segments(
             )
         except Exception as exc:
             if active_device == "cuda" and is_cuda_runtime_error(exc):
+                fallback_model = cpu_fallback_whisper_model(active_model_name)
                 if status_callback is not None:
                     status_callback(
-                        "[whisper] CUDA runtime became unavailable during transcription. Retrying on CPU..."
+                        f"[whisper] CUDA runtime became unavailable during transcription. Retrying on CPU with '{fallback_model}'..."
                     )
-                logging.warning(
-                    "Whisper CUDA transcription failed (%s). Retrying with CPU.",
+                logging.info(
+                    "Whisper CUDA transcription failed (%s). Retrying with CPU model '%s'.",
                     exc,
+                    fallback_model,
                 )
                 active_device = "cpu"
-                model = load_whisper_model(model_name, "cpu", hf_token=hf_token)
+                active_model_name = fallback_model
+                model = load_whisper_model(active_model_name, "cpu", hf_token=hf_token)
                 whisper_segments, _info = model.transcribe(
                     str(target_audio_path),
                     **transcribe_kwargs,
@@ -825,7 +879,11 @@ def replace_untranslated_tokens(
 
     repaired_text = translated_text
     for token in sorted(common_tokens, key=len, reverse=True):
-        replacement = word_translator.translate(token)
+        try:
+            replacement = word_translator.translate(token)
+        except Exception:
+            # Some providers raise on uncommon/non-English tokens; keep pipeline running.
+            continue
         if replacement is None:
             continue
         replacement = replacement.strip()
@@ -935,7 +993,8 @@ def translate_segments(
     translation_provider: str = "google",
 ) -> None:
     translator = build_translator(translation_provider, source="auto", target=target_lang)
-    for seg in tqdm(segments, desc="Translating"):
+    segment_items = list(segments)
+    for seg in tqdm(segment_items, desc="Translating"):
         seg.translated_text = translator.translate(seg.source_text)
 
 
@@ -949,9 +1008,16 @@ def translate_segments_with_progress(
     normalized_provider = translation_provider.strip().lower() if translation_provider else "google"
     translator = build_translator(normalized_provider, source="auto", target=target_lang)
     fallback_provider = "mymemory" if normalized_provider == "google" else "google"
-    fallback_translator = build_translator(fallback_provider, source="en", target=target_lang)
+    fallback_translator = build_translator(fallback_provider, source="auto", target=target_lang)
     word_translator = build_translator("google", source="en", target=target_lang)
     translation_cache: dict[str, str] = {}
+
+    def recommended_translation_workers(item_count: int) -> int:
+        # Bounded worker count to avoid overwhelming provider APIs.
+        if item_count < 20:
+            return 1
+        cpu_count = os.cpu_count() or 4
+        return max(1, min(6, cpu_count // 2))
 
     def should_retry_with_english_source(source_text: str, translated_text: str) -> bool:
         if target_lang == "en":
@@ -967,28 +1033,71 @@ def translate_segments_with_progress(
         word_count = len(source_clean.split())
         return len(alpha_chars) >= 4 and word_count >= 2
 
+    def translate_source_text(source_text: str) -> str:
+        translated = safe_translate(source_text, translator, fallback_translator)
+
+        if should_retry_with_english_source(source_text, translated) or has_untranslated_english_tokens(
+            source_text, translated, target_lang
+        ):
+            retry = safe_translate(source_text, fallback_translator, translator)
+            if retry is not None and retry.strip():
+                translated = retry
+
+        if has_untranslated_english_tokens(source_text, translated, target_lang):
+            translated = replace_untranslated_tokens(source_text, translated, word_translator)
+
+        return translated
+
     total = len(segments)
     unchanged_count = 0
-    for idx, seg in enumerate(tqdm(segments, desc="Translating"), start=1):
+    if total <= 0:
+        return
+
+    segment_keys: list[str] = []
+    source_by_key: dict[str, str] = {}
+    key_counts: dict[str, int] = {}
+    for seg in segments:
         source_key = re.sub(r"\s+", " ", seg.source_text).strip().lower()
-        cached_translation = translation_cache.get(source_key)
+        segment_keys.append(source_key)
+        if source_key not in source_by_key:
+            source_by_key[source_key] = seg.source_text
+            key_counts[source_key] = 0
+        key_counts[source_key] += 1
 
-        if cached_translation is not None:
-            translated = cached_translation
-        else:
-            translated = safe_translate(seg.source_text, translator, fallback_translator)
+    unique_items = list(source_by_key.items())
+    worker_count = min(recommended_translation_workers(total), len(unique_items))
 
-            if should_retry_with_english_source(seg.source_text, translated) or has_untranslated_english_tokens(
-                seg.source_text, translated, target_lang
-            ):
-                retry = safe_translate(seg.source_text, fallback_translator, translator)
-                if retry is not None and retry.strip():
-                    translated = retry
+    if worker_count > 1 and len(unique_items) > 1:
+        completed_segments = 0
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_map = {
+                executor.submit(translate_source_text, source_text): source_key
+                for source_key, source_text in unique_items
+            }
+            for future in tqdm(as_completed(future_map), total=len(future_map), desc="Translating"):
+                source_key = future_map[future]
+                source_text = source_by_key[source_key]
+                try:
+                    translation_cache[source_key] = future.result()
+                except Exception:
+                    # Keep the job moving if one provider call fails unexpectedly.
+                    translation_cache[source_key] = source_text
+                completed_segments += key_counts.get(source_key, 1)
+                if segment_progress_callback is not None:
+                    segment_progress_callback(min(completed_segments, total), total)
+    else:
+        completed_segments = 0
+        for idx, (source_key, source_text) in enumerate(tqdm(unique_items, desc="Translating"), start=1):
+            try:
+                translation_cache[source_key] = translate_source_text(source_text)
+            except Exception:
+                translation_cache[source_key] = source_text
+            completed_segments += key_counts.get(source_key, 1)
+            if segment_progress_callback is not None:
+                segment_progress_callback(min(completed_segments, total), total)
 
-            if has_untranslated_english_tokens(seg.source_text, translated, target_lang):
-                translated = replace_untranslated_tokens(seg.source_text, translated, word_translator)
-
-            translation_cache[source_key] = translated
+    for seg, source_key in zip(segments, segment_keys):
+        translated = translation_cache.get(source_key, seg.source_text)
 
         if glossary_overrides:
             translated = apply_glossary_overrides(translated, glossary_overrides)
@@ -1000,8 +1109,6 @@ def translate_segments_with_progress(
                 unchanged_count += 1
 
         seg.translated_text = translated
-        if segment_progress_callback is not None:
-            segment_progress_callback(idx, total)
 
     if target_lang != "en" and total > 0 and unchanged_count / total > 0.45:
         raise RuntimeError(
@@ -1351,11 +1458,12 @@ def mux_video_with_dub(
     dubbed_wav: Path,
     output_video: Path,
     background_mix_level: float = 0.08,
+    include_original_audio: bool = True,
 ) -> None:
-    # Keep original ambience quietly under dubbed speech for more natural output.
-    mix = min(max(background_mix_level, 0.0), 1.0)
-    run_cmd(
-        [
+    if include_original_audio:
+        # Keep original ambience quietly under dubbed speech for more natural output.
+        mix = min(max(background_mix_level, 0.0), 1.0)
+        cmd = [
             "ffmpeg",
             "-y",
             "-i",
@@ -1375,7 +1483,28 @@ def mux_video_with_dub(
             "-shortest",
             str(output_video),
         ]
-    )
+    else:
+        # Output dubbed speech only, preserving the original video stream.
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_video),
+            "-i",
+            str(dubbed_wav),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(output_video),
+        ]
+
+    run_cmd(cmd)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1401,6 +1530,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-time", type=float, default=0.0, help="Start time in seconds for dubbing window")
     parser.add_argument("--end-time", type=float, default=None, help="Optional end time in seconds for dubbing window")
     parser.add_argument("--keep-temp", action="store_true", help="Keep intermediate files")
+    parser.add_argument(
+        "--disable-original-audio",
+        action="store_true",
+        help="Disable original source audio in the final mix (dubbed speech only)",
+    )
     parser.add_argument(
         "--optimization-profile",
         default="auto",
@@ -1429,6 +1563,7 @@ def autodub_video(
     tts_engine: str = "edge",
     edge_voice: str | None = None,
     background_mix_level: float = 0.08,
+    include_original_audio: bool = True,
     min_stretch_speed: float = 0.85,
     max_stretch_speed: float = 1.80,
     silence_trim_ms: int = 0,
@@ -1636,11 +1771,14 @@ def autodub_video(
 
         report("[5/5] Muxing dubbed audio into video...")
         report_progress(0.92, "Muxing audio and video")
+        if not include_original_audio:
+            report("[mix] Original source audio disabled; exporting dubbed speech only.")
         mux_video_with_dub(
             working_video,
             dubbed_wav,
             output_path,
             background_mix_level=background_mix_level,
+            include_original_audio=include_original_audio,
         )
         report_progress(1.0, "Completed")
 
@@ -1669,6 +1807,7 @@ def main() -> int:
         hf_token=args.hf_token,
         tts_engine=args.tts_engine,
         edge_voice=args.edge_voice,
+        include_original_audio=not args.disable_original_audio,
         start_time_s=args.start_time,
         end_time_s=args.end_time,
         keep_temp=args.keep_temp,
@@ -1683,5 +1822,8 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:  # pragma: no cover
-        print(f"Error: {exc}", file=sys.stderr)
+        if sys.stderr is not None:
+            print(f"Error: {exc}", file=sys.stderr)
+        else:
+            print(f"Error: {exc}")
         raise SystemExit(1)

@@ -180,6 +180,7 @@ def run_dub(
     edge_voice: str,
     translation_provider: str,
     hf_token: str,
+    include_original_audio: bool,
     export_srt: bool,
     resume_enabled: bool,
     glossary_text: str,
@@ -294,6 +295,7 @@ def run_dub(
             hf_token=hf_token.strip() or None,
             tts_engine=tts_engine,
             edge_voice=edge_voice if tts_engine == "edge" else None,
+            include_original_audio=include_original_audio,
             export_srt=export_srt,
             resume_enabled=resume_enabled,
             glossary_text=glossary_text,
@@ -394,6 +396,11 @@ Upload a video, choose target language, and generate a dubbed version.
                     placeholder="hf_...",
                     info="Avoids the HF Hub auth warning and can improve Whisper download rate limits",
                 )
+                include_original_audio = gr.Checkbox(
+                    label="Keep original audio quietly in background",
+                    value=True,
+                    info="Turn off for dubbed voice only",
+                )
                 export_srt = gr.Checkbox(
                     label="Export translated subtitles (.srt)",
                     value=True,
@@ -477,6 +484,7 @@ Upload a video, choose target language, and generate a dubbed version.
                 edge_voice,
                 translation_provider,
                 hf_token,
+                include_original_audio,
                 export_srt,
                 resume_enabled,
                 glossary_text,

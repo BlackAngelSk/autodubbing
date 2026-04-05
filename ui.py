@@ -292,7 +292,7 @@ def run_dub(
             device=device,
             optimization_profile=optimization_profile,
             translation_provider=translation_provider,
-            hf_token=hf_token.strip() or None,
+            hf_token=(hf_token or "").strip() or None,
             tts_engine=tts_engine,
             edge_voice=edge_voice if tts_engine == "edge" else None,
             include_original_audio=include_original_audio,
@@ -337,86 +337,97 @@ Upload a video, choose target language, and generate a dubbed version.
                 run_button = gr.Button("2) Generate Dubbed Video", variant="primary")
             with gr.Column(scale=1):
                 gr.Markdown("### 3) Settings")
-                quality_preset = gr.Radio(
-                    label="Quality Preset",
-                    choices=QUALITY_PRESET_CHOICES,
-                    value="balanced",
-                    info="Quickly choose fast, balanced, or best-quality defaults",
-                )
-                hardware_hint = gr.Markdown(build_runtime_note("small", "auto", "auto", "edge"))
-                target_lang = gr.Dropdown(
-                    label="Target Language",
-                    choices=LANGUAGE_CHOICES,
-                    value="es",
-                    info="Pick the language for dubbed speech",
-                )
-                whisper_model = gr.Dropdown(
-                    label="Whisper Model",
-                    choices=WHISPER_MODEL_CHOICES,
-                    value="small",
-                    info="Larger models are more accurate; `large-v3` is best on GPU",
-                )
-                device = gr.Radio(
-                    label="Device",
-                    choices=["auto", "cpu", "cuda"],
-                    value="auto",
-                    info=f"Auto currently resolves to {AUTO_DEVICE} on this machine",
-                )
-                optimization_profile = gr.Dropdown(
-                    label="Optimization Profile",
-                    choices=[
-                        ("Auto (recommended)", "auto"),
-                        ("Balanced", "balanced"),
-                        ("Short video quality", "short"),
-                        ("Long video stability", "long"),
-                    ],
-                    value="auto",
-                    info="Auto tunes for short clips or long videos",
-                )
-                tts_engine = gr.Radio(
-                    label="TTS Engine",
-                    choices=["edge", "gtts"],
-                    value="edge",
-                    info="Edge sounds more natural in most cases",
-                )
-                edge_voice = gr.Dropdown(
-                    label="Edge Voice",
-                    choices=EDGE_VOICE_CHOICES,
-                    value=voice_for_language("es"),
-                )
-                translation_provider = gr.Radio(
-                    label="Translation Provider",
-                    choices=TRANSLATION_PROVIDER_CHOICES,
-                    value="google",
-                    info="Google is the default; MyMemory is a good alternate when needed",
-                )
-                hf_token = gr.Textbox(
-                    label="Hugging Face Token (optional)",
-                    type="password",
-                    placeholder="hf_...",
-                    info="Avoids the HF Hub auth warning and can improve Whisper download rate limits",
-                )
-                include_original_audio = gr.Checkbox(
-                    label="Keep original audio quietly in background",
-                    value=True,
-                    info="Turn off for dubbed voice only",
-                )
-                export_srt = gr.Checkbox(
-                    label="Export translated subtitles (.srt)",
-                    value=True,
-                )
-                resume_enabled = gr.Checkbox(
-                    label="Resume previous job if possible",
-                    value=True,
-                    info="Reuses cached chunks and translations on reruns",
-                )
-                glossary_text = gr.Textbox(
-                    label="Glossary Overrides",
-                    lines=4,
-                    placeholder="death => smrti\nwar => vojna",
-                    info="Optional forced translations, one rule per line",
-                )
-                with gr.Accordion("Custom time range (optional)", open=False):
+                with gr.Accordion("Core", open=True):
+                    quality_preset = gr.Radio(
+                        label="Quality Preset",
+                        choices=QUALITY_PRESET_CHOICES,
+                        value="balanced",
+                        info="Quickly choose fast, balanced, or best-quality defaults",
+                    )
+                    target_lang = gr.Dropdown(
+                        label="Target Language",
+                        choices=LANGUAGE_CHOICES,
+                        value="es",
+                        info="Pick the language for dubbed speech",
+                    )
+                    whisper_model = gr.Dropdown(
+                        label="Whisper Model",
+                        choices=WHISPER_MODEL_CHOICES,
+                        value="small",
+                        info="Larger models are more accurate; large-v3 is best on GPU",
+                    )
+                    device = gr.Radio(
+                        label="Device",
+                        choices=["auto", "cpu", "cuda"],
+                        value="auto",
+                        info=f"Auto currently resolves to {AUTO_DEVICE} on this machine",
+                    )
+                    optimization_profile = gr.Dropdown(
+                        label="Optimization Profile",
+                        choices=[
+                            ("Auto (recommended)", "auto"),
+                            ("Balanced", "balanced"),
+                            ("Short video quality", "short"),
+                            ("Long video stability", "long"),
+                        ],
+                        value="auto",
+                        info="Auto tunes for short clips or long videos",
+                    )
+                    hardware_hint = gr.Markdown(build_runtime_note("small", "auto", "auto", "edge"))
+
+                with gr.Accordion("Voice", open=True):
+                    tts_engine = gr.Radio(
+                        label="TTS Engine",
+                        choices=["edge", "gtts"],
+                        value="edge",
+                        info="Edge sounds more natural in most cases",
+                    )
+                    edge_voice = gr.Dropdown(
+                        label="Edge Voice",
+                        choices=EDGE_VOICE_CHOICES,
+                        value=voice_for_language("es"),
+                    )
+
+                with gr.Accordion("Translation", open=False):
+                    translation_provider = gr.Radio(
+                        label="Translation Provider",
+                        choices=TRANSLATION_PROVIDER_CHOICES,
+                        value="google",
+                        info="Google is the default; MyMemory is a good alternate when needed",
+                    )
+                    glossary_text = gr.Textbox(
+                        label="Glossary Overrides",
+                        lines=4,
+                        placeholder="death => smrti\nwar => vojna",
+                        info="Optional forced translations, one rule per line",
+                    )
+
+                with gr.Accordion("Output", open=False):
+                    include_original_audio = gr.Checkbox(
+                        label="Keep original audio quietly in background",
+                        value=True,
+                        info="Turn off for dubbed voice only",
+                    )
+                    export_srt = gr.Checkbox(
+                        label="Export translated subtitles (.srt)",
+                        value=True,
+                    )
+
+                with gr.Accordion("Advanced", open=False):
+                    hf_token = gr.Textbox(
+                        label="Hugging Face Token (optional)",
+                        type="password",
+                        placeholder="hf_...",
+                        info="Avoids the HF Hub auth warning and can improve Whisper download rate limits",
+                    )
+                    resume_enabled = gr.Checkbox(
+                        label="Resume previous job if possible",
+                        value=True,
+                        info="Reuses cached chunks and translations on reruns",
+                    )
+                    keep_temp = gr.Checkbox(label="Keep temp files", value=False)
+
+                with gr.Accordion("Custom Time Range", open=False):
                     use_time_range = gr.Checkbox(
                         label="Enable custom time range",
                         value=False,
@@ -434,7 +445,6 @@ Upload a video, choose target language, and generate a dubbed version.
                         precision=0,
                         info="Leave empty to dub until video end",
                     )
-                keep_temp = gr.Checkbox(label="Keep temp files", value=False)
 
         target_lang.change(fn=on_language_change, inputs=[target_lang, tts_engine], outputs=[edge_voice])
         tts_engine.change(fn=on_tts_engine_change, inputs=[tts_engine, target_lang], outputs=[edge_voice])

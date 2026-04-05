@@ -263,6 +263,14 @@ class Segment:
     translated_text: str = ""
 
 
+def safe_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
 def format_srt_timestamp(seconds: float) -> str:
     total_ms = max(int(round(seconds * 1000)), 0)
     hours, remainder = divmod(total_ms, 3_600_000)
@@ -274,7 +282,7 @@ def format_srt_timestamp(seconds: float) -> str:
 def write_srt(segments: Iterable[Segment], srt_path: Path) -> None:
     lines: list[str] = []
     for index, seg in enumerate(segments, start=1):
-        subtitle_text = (seg.translated_text or seg.source_text).strip()
+        subtitle_text = (safe_text(seg.translated_text) or safe_text(seg.source_text)).strip()
         if not subtitle_text:
             continue
         lines.extend(
@@ -286,6 +294,64 @@ def write_srt(segments: Iterable[Segment], srt_path: Path) -> None:
             ]
         )
     srt_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
+def normalize_subtitle_for_dedupe(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", safe_text(text)).strip().lower()
+    return re.sub(r"[^\w\s]", "", normalized)
+
+
+def collapse_consecutive_duplicate_segments(segments: List[Segment], max_gap_s: float = 0.35) -> List[Segment]:
+    if not segments:
+        return segments
+
+    ordered = sorted(segments, key=lambda seg: seg.start_s)
+    merged: List[Segment] = [ordered[0]]
+
+    for seg in ordered[1:]:
+        prev = merged[-1]
+        prev_text = normalize_subtitle_for_dedupe(prev.translated_text or prev.source_text)
+        current_text = normalize_subtitle_for_dedupe(seg.translated_text or seg.source_text)
+
+        is_duplicate_text = bool(prev_text) and prev_text == current_text
+        close_enough = seg.start_s <= prev.end_s + max_gap_s
+
+        if is_duplicate_text and close_enough:
+            prev.end_s = max(prev.end_s, seg.end_s)
+            if len(safe_text(seg.translated_text).strip()) > len(safe_text(prev.translated_text).strip()):
+                prev.translated_text = safe_text(seg.translated_text)
+            if len(safe_text(seg.source_text).strip()) > len(safe_text(prev.source_text).strip()):
+                prev.source_text = safe_text(seg.source_text)
+            continue
+
+        merged.append(seg)
+
+    return merged
+
+
+def cached_translation_looks_poor(segments: Iterable[Segment], target_lang: str) -> bool:
+    if target_lang == "en":
+        return False
+
+    items = list(segments)
+    if not items:
+        return False
+
+    unchanged = 0
+    empty = 0
+    for seg in items:
+        source_clean = re.sub(r"\s+", " ", safe_text(seg.source_text)).strip().lower()
+        translated_clean = re.sub(r"\s+", " ", safe_text(seg.translated_text)).strip().lower()
+        if not translated_clean:
+            empty += 1
+            continue
+        if source_clean and source_clean == translated_clean:
+            unchanged += 1
+
+    total = len(items)
+    unchanged_ratio = unchanged / total
+    empty_ratio = empty / total
+    return unchanged_ratio > 0.35 or empty_ratio > 0.12
 
 
 def build_translator(provider: str, source: str, target: str) -> Any:
@@ -341,11 +407,33 @@ def load_segments_from_json(input_path: Path) -> List[Segment]:
         Segment(
             start_s=float(item["start_s"]),
             end_s=float(item["end_s"]),
-            source_text=str(item["source_text"]),
-            translated_text=str(item.get("translated_text", "")),
+            source_text=safe_text(item.get("source_text", "")),
+            translated_text=safe_text(item.get("translated_text", "")),
         )
         for item in raw
     ]
+
+
+def build_dub_cache_signature(
+    segments: Iterable[Segment],
+    target_lang: str,
+    tts_engine: str,
+    edge_voice: str | None,
+    min_stretch_speed: float,
+    max_stretch_speed: float,
+    silence_trim_ms: int,
+) -> str:
+    payload = {
+        "target_lang": target_lang,
+        "tts_engine": tts_engine,
+        "edge_voice": edge_voice or "",
+        "min_stretch_speed": round(min_stretch_speed, 4),
+        "max_stretch_speed": round(max_stretch_speed, 4),
+        "silence_trim_ms": int(silence_trim_ms),
+        "segments": [asdict(seg) for seg in segments],
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
 
 
 def build_resume_dir(
@@ -534,7 +622,12 @@ def transcribe_segments(
         cache_dir.mkdir(parents=True, exist_ok=True)
         full_cache_path = cache_dir / f"segments_{model_name}_{resolved_device}.json"
         if full_cache_path.exists():
-            return load_segments_from_json(full_cache_path)
+            cached_segments = load_segments_from_json(full_cache_path)
+            # Guard against stale/weak ASR caches that miss long opening speech.
+            if cached_segments and cached_segments[0].start_s <= 7.0:
+                return cached_segments
+            if status_callback is not None:
+                status_callback("[resume] ASR cache starts too late; rebuilding transcription for better opening coverage...")
     else:
         full_cache_path = None
 
@@ -552,7 +645,7 @@ def transcribe_segments(
     )
 
     def normalize_text(text: str) -> str:
-        lowered = text.strip().lower()
+        lowered = safe_text(text).strip().lower()
         lowered = re.sub(r"\s+", " ", lowered)
         return re.sub(r"[^\w\s']+", "", lowered)
 
@@ -596,7 +689,7 @@ def transcribe_segments(
             # Drop tiny/noisy fragments from relaxed pass.
             if cand.end_s <= cand.start_s + 0.09:
                 continue
-            if len(cand.source_text.strip()) < 2:
+            if len(safe_text(cand.source_text).strip()) < 2:
                 continue
 
             overlaps = [existing for existing in merged if has_time_overlap(existing, cand)]
@@ -627,8 +720,8 @@ def transcribe_segments(
             gap_s = max(seg.start_s - prev.end_s, 0.0)
             prev_duration_s = prev.end_s - prev.start_s
             combined_duration_s = seg.end_s - prev.start_s
-            prev_text = prev.source_text.strip()
-            next_text = seg.source_text.strip()
+            prev_text = safe_text(prev.source_text).strip()
+            next_text = safe_text(seg.source_text).strip()
             looks_like_continuation = (
                 (prev_text and prev_text[-1] not in ".!?;:")
                 or (next_text[:1].islower() if next_text else False)
@@ -695,7 +788,7 @@ def transcribe_segments(
 
         collected: List[Segment] = []
         for seg in whisper_segments:
-            text = seg.text.strip()
+            text = safe_text(getattr(seg, "text", "")).strip()
             if not text:
                 continue
             start_s, end_s = resolve_segment_bounds(seg)
@@ -768,6 +861,40 @@ def transcribe_segments(
             return existing_segments
         return existing_segments + sorted(appended, key=lambda seg: seg.start_s)
 
+    def recover_head_segments(existing_segments: List[Segment], source_audio_path: Path) -> List[Segment]:
+        if not existing_segments:
+            return existing_segments
+
+        first_start_s = existing_segments[0].start_s
+
+        # Always probe the opening window with relaxed VAD to catch intro narration
+        # that can be partially missed even when first_start_s is near zero.
+        head_probe_end_s = min(max(first_start_s + 2.0, 12.0), 20.0)
+        head_audio = AudioSegment.from_wav(source_audio_path)[: int(head_probe_end_s * 1000)]
+        head_path = source_audio_path.parent / "head_recheck.wav"
+        head_audio.export(head_path, format="wav")
+
+        recovered_segments = collect_segments(head_path, vad_filter=False, relaxed=True)
+        prepended: List[Segment] = []
+        seen_texts = {normalize_text(seg.source_text) for seg in existing_segments[:5]}
+
+        for seg in recovered_segments:
+            normalized = normalize_text(seg.source_text)
+            if not normalized or normalized in seen_texts:
+                continue
+            # Keep only opening-window segments and avoid overlap duplicates.
+            if seg.start_s > head_probe_end_s:
+                continue
+            if any(has_time_overlap(seg, existing, padding_s=0.10) for existing in existing_segments[:6]):
+                continue
+
+            prepended.append(seg)
+            seen_texts.add(normalized)
+
+        if not prepended:
+            return existing_segments
+        return merge_recall_segments(existing_segments, prepended)
+
     def transcribe_single_audio(target_audio_path: Path) -> List[Segment]:
         primary_segments = collect_segments(target_audio_path, vad_filter=True)
         recall_segments = collect_segments(target_audio_path, vad_filter=False, relaxed=True)
@@ -775,10 +902,12 @@ def transcribe_segments(
         if primary_segments:
             merged_segments = merge_recall_segments(primary_segments, recall_segments)
             recovered = recover_tail_segments(merged_segments, target_audio_path)
+            recovered = recover_head_segments(recovered, target_audio_path)
             return merge_tts_friendly_segments(recovered)
 
         # If VAD pass found nothing, use relaxed no-VAD pass.
         recovered = recover_tail_segments(recall_segments, target_audio_path)
+        recovered = recover_head_segments(recovered, target_audio_path)
         return merge_tts_friendly_segments(recovered)
 
     audio_duration_s = len(AudioSegment.from_wav(audio_path)) / 1000.0
@@ -1012,12 +1141,15 @@ def translate_segments_with_progress(
     word_translator = build_translator("google", source="en", target=target_lang)
     translation_cache: dict[str, str] = {}
 
-    def recommended_translation_workers(item_count: int) -> int:
-        # Bounded worker count to avoid overwhelming provider APIs.
+    def recommended_translation_workers(item_count: int, provider: str) -> int:
+        # Keep concurrency conservative to avoid provider throttling and translation quality drops.
         if item_count < 20:
             return 1
-        cpu_count = os.cpu_count() or 4
-        return max(1, min(6, cpu_count // 2))
+        if provider == "google":
+            return 2
+        if provider == "mymemory":
+            return 3
+        return 1
 
     def should_retry_with_english_source(source_text: str, translated_text: str) -> bool:
         if target_lang == "en":
@@ -1065,7 +1197,7 @@ def translate_segments_with_progress(
         key_counts[source_key] += 1
 
     unique_items = list(source_by_key.items())
-    worker_count = min(recommended_translation_workers(total), len(unique_items))
+    worker_count = min(recommended_translation_workers(total, normalized_provider), len(unique_items))
 
     if worker_count > 1 and len(unique_items) > 1:
         completed_segments = 0
@@ -1577,6 +1709,15 @@ def autodub_video(
     progress_callback: Callable[[str], None] | None = None,
     progress_percent_callback: Callable[[float, str], None] | None = None,
 ) -> int:
+    started_at = time.perf_counter()
+
+    def has_weak_opening_coverage(segments: List[Segment]) -> bool:
+        if not segments:
+            return True
+        first_start = segments[0].start_s
+        early_segments = [seg for seg in segments if seg.start_s < 12.0]
+        return first_start > 1.4 or len(early_segments) < 2
+
     def report(message: str) -> None:
         if progress_callback is not None:
             progress_callback(message)
@@ -1630,6 +1771,7 @@ def autodub_video(
         segments_json = (resume_dir / "segments.json") if resume_dir is not None else (temp_base / "segments.json")
         asr_cache_dir = (resume_dir / "asr") if resume_dir is not None else None
         tts_cache_dir = (resume_dir / "tts_chunks") if resume_dir is not None else None
+        dub_meta_path = (resume_dir / "dubbed_meta.json") if resume_dir is not None else (temp_base / "dubbed_meta.json")
         subtitle_path = output_path.with_suffix(".srt")
         glossary_overrides = parse_glossary_overrides(glossary_text)
 
@@ -1682,6 +1824,28 @@ def autodub_video(
         if segments_json.exists():
             segments = load_segments_from_json(segments_json)
             report(f"[resume] Reusing cached segments ({len(segments)} segments)...")
+            if has_weak_opening_coverage(segments):
+                report("[resume] Cached ASR seems to miss opening speech; rebuilding transcription...")
+                report_progress(0.12, "Re-transcribing opening coverage")
+
+                def asr_chunk_progress(done: int, total: int) -> None:
+                    start = 0.12
+                    end = 0.35
+                    fraction = done / max(total, 1)
+                    report_progress(start + (end - start) * fraction, f"Transcribing chunks ({done}/{total})")
+
+                segments = transcribe_segments(
+                    extracted_wav,
+                    cast(str, resolved_settings["whisper_model"]),
+                    cast(str, resolved_settings["device"]),
+                    chunk_length_s=cast(float | None, resolved_settings["transcribe_chunk_s"]),
+                    cache_dir=asr_cache_dir,
+                    chunk_progress_callback=asr_chunk_progress,
+                    status_callback=report,
+                    hf_token=hf_token,
+                )
+                save_segments_to_json(segments, segments_json)
+
             report_progress(0.35, f"Transcription complete ({len(segments)} segments)")
         else:
             report_progress(0.12, "Transcribing speech")
@@ -1719,7 +1883,10 @@ def autodub_video(
             fraction = done / max(total, 1)
             report_progress(start + (end - start) * fraction, f"Translating ({done}/{total})")
 
-        needs_translation = any(not seg.translated_text.strip() for seg in segments)
+        needs_translation = any(not safe_text(seg.translated_text).strip() for seg in segments)
+        if not needs_translation and cached_translation_looks_poor(segments, target_lang):
+            report("[resume] Cached translations look low quality; re-translating segments...")
+            needs_translation = True
         if needs_translation:
             translate_segments_with_progress(
                 segments,
@@ -1733,15 +1900,45 @@ def autodub_video(
             report("[resume] Reusing cached translations...")
             report_progress(0.60, f"Translating ({len(segments)}/{len(segments)})")
 
+        deduped_segments = collapse_consecutive_duplicate_segments(segments)
+        removed_count = len(segments) - len(deduped_segments)
+        if removed_count > 0:
+            report(f"[clean] Collapsed {removed_count} consecutive duplicate subtitle segment(s).")
+            segments = deduped_segments
+            save_segments_to_json(segments, segments_json)
+
         if export_srt:
             write_srt(segments, subtitle_path)
             report(f"[srt] Subtitle file written to: {subtitle_path}")
 
         report("[4/5] Generating dubbed track...")
-        if dubbed_wav.exists():
+        active_min_stretch = cast(float, resolved_settings["min_stretch_speed"])
+        active_max_stretch = cast(float, resolved_settings["max_stretch_speed"])
+        active_silence_trim = cast(int, resolved_settings["silence_trim_ms"])
+        dub_signature = build_dub_cache_signature(
+            segments,
+            target_lang=target_lang,
+            tts_engine=tts_engine,
+            edge_voice=edge_voice,
+            min_stretch_speed=active_min_stretch,
+            max_stretch_speed=active_max_stretch,
+            silence_trim_ms=active_silence_trim,
+        )
+
+        can_reuse_dubbed_audio = False
+        if dubbed_wav.exists() and dub_meta_path.exists():
+            try:
+                dub_meta = json.loads(dub_meta_path.read_text(encoding="utf-8"))
+                can_reuse_dubbed_audio = dub_meta.get("signature") == dub_signature
+            except Exception:
+                can_reuse_dubbed_audio = False
+
+        if can_reuse_dubbed_audio:
             report("[resume] Reusing cached dubbed audio...")
             report_progress(0.90, "Synthesizing voice (cached)")
         else:
+            if dubbed_wav.exists():
+                report("[resume] Dubbed audio cache is stale; regenerating from current segments...")
             report_progress(0.62, "Generating neural voice")
 
             def tts_progress(done: int, total: int) -> None:
@@ -1758,14 +1955,18 @@ def autodub_video(
                 target_lang,
                 tts_engine=tts_engine,
                 edge_voice=edge_voice,
-                min_stretch_speed=cast(float, resolved_settings["min_stretch_speed"]),
-                max_stretch_speed=cast(float, resolved_settings["max_stretch_speed"]),
-                silence_trim_ms=cast(int, resolved_settings["silence_trim_ms"]),
+                min_stretch_speed=active_min_stretch,
+                max_stretch_speed=active_max_stretch,
+                silence_trim_ms=active_silence_trim,
                 segment_progress_callback=tts_progress,
                 chunk_window_s=cast(float | None, resolved_settings["tts_chunk_window_s"]),
                 cache_dir=tts_cache_dir,
             )
             dubbed_track.export(dubbed_wav, format="wav")
+            dub_meta_path.write_text(
+                json.dumps({"signature": dub_signature}, indent=2),
+                encoding="utf-8",
+            )
 
         save_segments_to_json(segments, segments_json)
 
@@ -1783,6 +1984,9 @@ def autodub_video(
         report_progress(1.0, "Completed")
 
         report(f"Done. Output written to: {output_path}")
+        elapsed_s = time.perf_counter() - started_at
+        elapsed_m, elapsed_rem_s = divmod(int(round(elapsed_s)), 60)
+        report(f"Total processing time: {elapsed_m}m {elapsed_rem_s:02d}s")
         if keep_temp:
             report(f"Temp files kept at: {temp_base}")
         return 0

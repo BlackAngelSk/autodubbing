@@ -67,6 +67,110 @@ LARGE_WHISPER_MODELS = {"large-v2", "large-v3", "large-v3-turbo", "distil-large-
 AUTO_DEVICE = "cuda" if detect_cuda_available() else "cpu"
 
 
+APP_CSS = """
+:root {
+    --ad-bg: #f4f6fb;
+    --ad-panel: #ffffff;
+    --ad-text: #111827;
+    --ad-muted: #374151;
+    --ad-border: #cbd5e1;
+    --ad-input-bg: #ffffff;
+    --ad-input-text: #111827;
+    --ad-accent: #2563eb;
+    --ad-accent-text: #ffffff;
+    --ad-option-bg: #f8fafc;
+    --ad-option-text: #111827;
+}
+
+html.ad-dark,
+body.ad-dark {
+    --ad-bg: #0b1220;
+    --ad-panel: #111827;
+    --ad-text: #f3f4f6;
+    --ad-muted: #d1d5db;
+    --ad-border: #334155;
+    --ad-input-bg: #0f172a;
+    --ad-input-text: #f8fafc;
+    --ad-accent: #3b82f6;
+    --ad-accent-text: #ffffff;
+    --ad-option-bg: #1e293b;
+    --ad-option-text: #f8fafc;
+}
+
+.gradio-container {
+    background: var(--ad-bg) !important;
+    color: var(--ad-text) !important;
+
+    --body-background-fill: var(--ad-bg);
+    --body-text-color: var(--ad-text);
+    --body-text-color-subdued: var(--ad-muted);
+    --background-fill-primary: var(--ad-bg);
+    --background-fill-secondary: var(--ad-panel);
+    --block-background-fill: var(--ad-panel);
+    --block-border-color: var(--ad-border);
+    --block-title-text-color: var(--ad-text);
+    --block-label-text-color: var(--ad-text);
+    --block-info-text-color: var(--ad-muted);
+    --input-background-fill: var(--ad-input-bg);
+    --input-border-color: var(--ad-border);
+    --input-text-color: var(--ad-input-text);
+    --input-placeholder-color: var(--ad-muted);
+    --button-primary-background-fill: var(--ad-accent);
+    --button-primary-text-color: var(--ad-accent-text);
+    --button-secondary-background-fill: var(--ad-option-bg);
+    --button-secondary-text-color: var(--ad-option-text);
+    --button-secondary-border-color: var(--ad-border);
+}
+
+#theme-mode {
+    border: 1px solid var(--ad-border);
+    border-radius: 10px;
+    padding: 8px;
+    background: var(--ad-panel);
+}
+
+#theme-mode label {
+    font-size: 12px;
+    color: var(--ad-text);
+}
+
+/* Force option text visibility in setting button groups/radios. */
+.gradio-container .gradio-radio label,
+.gradio-container .gradio-radio label *,
+.gradio-container .gradio-checkbox label,
+.gradio-container .gradio-checkbox label * {
+    color: var(--ad-option-text) !important;
+    opacity: 1 !important;
+}
+
+.gradio-container .gradio-radio label {
+    background: var(--ad-option-bg) !important;
+    border: 1px solid var(--ad-border) !important;
+}
+
+.gradio-container .gradio-radio label:has(input:checked),
+.gradio-container .gradio-radio label[aria-pressed="true"],
+.gradio-container button[aria-pressed="true"] {
+    background: var(--ad-accent) !important;
+    border-color: var(--ad-accent) !important;
+}
+
+.gradio-container .gradio-radio label:has(input:checked) *,
+.gradio-container .gradio-radio label[aria-pressed="true"] *,
+.gradio-container button[aria-pressed="true"] * {
+    color: var(--ad-accent-text) !important;
+}
+
+.gradio-container .info,
+.gradio-container .hint,
+.gradio-container [data-testid="block-info"],
+.gradio-container [class*="description"] {
+    color: var(--ad-muted) !important;
+    opacity: 1 !important;
+}
+"""
+
+
 def voice_for_language(lang: str) -> str:
     return DEFAULT_EDGE_VOICES.get(lang, DEFAULT_EDGE_VOICES["en"])
 
@@ -320,6 +424,18 @@ def run_dub(
 
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Auto Dubbing Studio") as demo:
+        with gr.Row():
+            theme_mode = gr.Radio(
+                label="Theme",
+                choices=[("Light", "light"), ("Dark", "dark")],
+                value="light",
+                elem_id="theme-mode",
+                scale=1,
+            )
+
+        def keep_theme_value(mode: str) -> str:
+            return mode
+
         gr.Markdown(
             """
 # Auto Dubbing Studio
@@ -506,13 +622,45 @@ Upload a video, choose target language, and generate a dubbed version.
             outputs=[output_video, status, logs, output_srt],
         )
 
+        demo.load(
+            fn=lambda: "light",
+            inputs=None,
+            outputs=[theme_mode],
+            js="""
+() => {
+    const key = 'autodub-theme-mode';
+    const saved = localStorage.getItem(key) === 'dark' ? 'dark' : 'light';
+    const dark = saved === 'dark';
+    document.documentElement.classList.toggle('ad-dark', dark);
+    document.body.classList.toggle('ad-dark', dark);
+    return [saved];
+}
+            """,
+        )
+
+        theme_mode.change(
+            fn=keep_theme_value,
+            inputs=[theme_mode],
+            outputs=[theme_mode],
+            js="""
+(mode) => {
+    const normalized = mode === 'dark' ? 'dark' : 'light';
+    const dark = normalized === 'dark';
+    document.documentElement.classList.toggle('ad-dark', dark);
+    document.body.classList.toggle('ad-dark', dark);
+    localStorage.setItem('autodub-theme-mode', normalized);
+    return [normalized];
+}
+            """,
+        )
+
     return demo
 
 
 def main() -> None:
     app = build_ui()
     app.queue(default_concurrency_limit=1)
-    app.launch(server_name="127.0.0.1", server_port=7860, show_error=True)
+    app.launch(server_name="127.0.0.1", server_port=7860, show_error=True, css=APP_CSS)
 
 
 if __name__ == "__main__":

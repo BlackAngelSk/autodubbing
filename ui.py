@@ -13,7 +13,7 @@ from time import perf_counter
 
 import gradio as gr
 
-from autodub import DEFAULT_EDGE_VOICES, autodub_video, detect_cuda_available
+from autodub import DEFAULT_EDGE_VOICES, autodub_video, detect_cuda_available, detect_rocm_available
 
 
 LANGUAGE_CHOICES = [
@@ -63,8 +63,13 @@ TRANSLATION_PROVIDER_CHOICES = [
     ("MyMemory", "mymemory"),
 ]
 
+ASR_ENGINE_CHOICES = [
+    ("Whisper (default, reliable)", "whisper"),
+    ("stable-ts (accurate timestamps, fixes missed opening)", "stable-ts"),
+]
+
 LARGE_WHISPER_MODELS = {"large-v2", "large-v3", "large-v3-turbo", "distil-large-v3"}
-AUTO_DEVICE = "cuda" if detect_cuda_available() else "cpu"
+AUTO_DEVICE = "cuda" if detect_cuda_available() else ("rocm" if detect_rocm_available() else "cpu")
 
 
 APP_CSS = """
@@ -192,7 +197,7 @@ def build_runtime_note(
     if whisper_model in LARGE_WHISPER_MODELS:
         lines.append("First use of this model may download several GB of Whisper weights.")
         lines.append("Optional: set `HF_TOKEN` or paste a Hugging Face token below to avoid the auth warning and improve rate limits.")
-    if resolved_device != "cuda" and whisper_model in LARGE_WHISPER_MODELS:
+    if resolved_device not in {"cuda", "rocm"} and whisper_model in LARGE_WHISPER_MODELS:
         lines.append("Large Whisper models on CPU can take a long time; `medium` is usually the safer fallback.")
     if tts_engine != "edge":
         lines.append("`gtts` is simpler but usually sounds less natural than `edge`.")
@@ -200,15 +205,7 @@ def build_runtime_note(
     return "### Smart guidance\n" + "\n".join(f"- {line}" for line in lines)
 
 
-def on_language_change(lang: str, tts_engine: str) -> gr.Dropdown:
-    return gr.Dropdown(
-        choices=EDGE_VOICE_CHOICES,
-        value=voice_for_language(lang),
-        interactive=tts_engine == "edge",
-    )
-
-
-def on_tts_engine_change(tts_engine: str, lang: str) -> gr.Dropdown:
+def _update_edge_voice_dropdown(lang: str, tts_engine: str) -> gr.Dropdown:
     return gr.Dropdown(
         choices=EDGE_VOICE_CHOICES,
         value=voice_for_language(lang),
@@ -224,7 +221,7 @@ def on_quality_preset_change(preset: str, tts_engine: str) -> tuple[gr.Dropdown,
     elif preset == "best":
         whisper_value = "large-v3"
         profile_value = "short"
-        device_value = "cuda" if AUTO_DEVICE == "cuda" else "auto"
+        device_value = AUTO_DEVICE if AUTO_DEVICE in {"cuda", "rocm"} else "auto"
     else:
         whisper_value = "small"
         profile_value = "auto"
@@ -292,6 +289,7 @@ def run_dub(
     start_time_s: float,
     end_time_s: float | None,
     keep_temp: bool,
+    asr_engine: str = "whisper",
     progress: gr.Progress = gr.Progress(),
 ) -> tuple[str | None, str, str, str | None]:
     logs: list[str] = []
@@ -406,6 +404,7 @@ def run_dub(
             start_time_s=normalized_start_time,
             end_time_s=normalized_end_time,
             keep_temp=keep_temp,
+            asr_engine=asr_engine,
             progress_callback=add_log,
             progress_percent_callback=update_progress,
         )
@@ -472,9 +471,15 @@ Upload a video, choose target language, and generate a dubbed version.
                         value="small",
                         info="Larger models are more accurate; large-v3 is best on GPU",
                     )
+                    asr_engine = gr.Radio(
+                        label="ASR Engine",
+                        choices=ASR_ENGINE_CHOICES,
+                        value="whisper",
+                        info="stable-ts fixes missed opening words and produces more precise timestamps. Install with: pip install stable-ts",
+                    )
                     device = gr.Radio(
                         label="Device",
-                        choices=["auto", "cpu", "cuda"],
+                        choices=["auto", "cpu", "cuda", "rocm"],
                         value="auto",
                         info=f"Auto currently resolves to {AUTO_DEVICE} on this machine",
                     )
@@ -515,6 +520,7 @@ Upload a video, choose target language, and generate a dubbed version.
                         label="Glossary Overrides",
                         lines=4,
                         placeholder="death => smrti\nwar => vojna",
+                        value="",
                         info="Optional forced translations, one rule per line",
                     )
 
@@ -562,8 +568,8 @@ Upload a video, choose target language, and generate a dubbed version.
                         info="Leave empty to dub until video end",
                     )
 
-        target_lang.change(fn=on_language_change, inputs=[target_lang, tts_engine], outputs=[edge_voice])
-        tts_engine.change(fn=on_tts_engine_change, inputs=[tts_engine, target_lang], outputs=[edge_voice])
+        target_lang.change(fn=_update_edge_voice_dropdown, inputs=[target_lang, tts_engine], outputs=[edge_voice])
+        tts_engine.change(fn=_update_edge_voice_dropdown, inputs=[target_lang, tts_engine], outputs=[edge_voice])
         quality_preset.change(
             fn=on_quality_preset_change,
             inputs=[quality_preset, tts_engine],
@@ -618,6 +624,7 @@ Upload a video, choose target language, and generate a dubbed version.
                 start_time_s,
                 end_time_s,
                 keep_temp,
+                asr_engine,
             ],
             outputs=[output_video, status, logs, output_srt],
         )

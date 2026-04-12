@@ -53,6 +53,7 @@ LARGE_WHISPER_MODELS = {
 }
 
 TRANSLATION_PROVIDERS = {"google", "mymemory"}
+ASR_ENGINE_CHOICES = {"whisper", "stable-ts"}
 HF_UNAUTH_WARNING_TEXT = "unauthenticated requests to the hf hub"
 
 
@@ -158,8 +159,58 @@ def detect_cuda_available() -> bool:
     return bool(completed.stdout.strip())
 
 
+def detect_rocm_available() -> bool:
+    """Detect AMD ROCm GPU availability via rocm-smi, rocminfo, or the KFD kernel device node."""
+    kfd_exists = Path("/dev/kfd").exists()
+    rocm_smi = shutil.which("rocm-smi")
+    rocminfo = shutil.which("rocminfo")
+    if rocm_smi is None and rocminfo is None and not kfd_exists:
+        return False
+
+    if rocm_smi is not None:
+        try:
+            completed = subprocess.run(
+                [rocm_smi, "--showid"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+            if completed.stdout.strip():
+                return True
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+    if rocminfo is not None:
+        try:
+            completed = subprocess.run(
+                [rocminfo],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+            if "agent" in completed.stdout.lower():
+                return True
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+    return kfd_exists
+
+
 def resolve_device_selection(device: str) -> str:
-    return "cuda" if device == "auto" and detect_cuda_available() else ("cpu" if device == "auto" else device)
+    if device == "rocm":
+        # AMD ROCm uses ctranslate2's CUDA backend via the HIP compatibility layer.
+        return "cuda"
+    if device != "auto":
+        return device
+    if detect_cuda_available():
+        return "cuda"
+    if detect_rocm_available():
+        return "cuda"
+    return "cpu"
 
 
 def preferred_whisper_compute_type(model_name: str, device: str) -> str:
@@ -177,16 +228,13 @@ def whisper_compute_type_candidates(model_name: str, device: str) -> list[str]:
     else:
         candidates = [preferred, "int8", "float32"]
 
-    ordered: list[str] = []
-    for compute in candidates:
-        if compute not in ordered:
-            ordered.append(compute)
-    return ordered
+    return list(dict.fromkeys(candidates))
 
 
 def is_cuda_runtime_error(exc: Exception) -> bool:
     message = str(exc).lower()
     markers = (
+        # NVIDIA CUDA
         "cublas",
         "cublas64",
         "cudnn",
@@ -195,6 +243,12 @@ def is_cuda_runtime_error(exc: Exception) -> bool:
         "cuda driver",
         "cannot be loaded",
         "failed to load",
+        # AMD ROCm / HIP
+        "hipblas",
+        "libamdhip64",
+        "amdhip",
+        "rocblas",
+        "hip error",
     )
     return any(marker in message for marker in markers)
 
@@ -448,19 +502,21 @@ def build_resume_dir(
     start_time_s: float,
     end_time_s: float | None,
     glossary_text: str,
+    asr_engine: str = "whisper",
 ) -> Path:
     job_signature = "|".join(
         [
             str(input_path.resolve()),
             target_lang,
             whisper_model,
+            asr_engine,
             translation_provider,
             tts_engine,
             edge_voice or "",
             optimization_profile,
             f"{start_time_s:.3f}",
             "none" if end_time_s is None else f"{end_time_s:.3f}",
-            hashlib.sha1(glossary_text.encode("utf-8")).hexdigest()[:10],
+            hashlib.sha1((glossary_text or "").encode("utf-8")).hexdigest()[:10],
         ]
     )
     short_hash = hashlib.sha1(job_signature.encode("utf-8")).hexdigest()[:12]
@@ -604,6 +660,162 @@ def trim_video(input_video: Path, output_video: Path, start_time_s: float, end_t
     run_cmd(cmd)
 
 
+def stable_ts_available() -> bool:
+    """Return True if stable-ts is installed and importable."""
+    try:
+        importlib.import_module("stable_whisper")
+        return True
+    except ImportError:
+        return False
+
+
+def _transcribe_with_stable_ts(
+    audio_path: Path,
+    model_name: str,
+    device: str,
+    chunk_length_s: float | None,
+    cache_dir: Path | None,
+    chunk_progress_callback: Callable[[int, int], None] | None,
+    status_callback: Callable[[str], None] | None,
+    hf_token: str | None,
+) -> List[Segment]:
+    """Transcribe audio with stable-ts for accurate timestamps and reliable opening coverage."""
+    stable_whisper = importlib.import_module("stable_whisper")
+    resolved_device = resolve_device_selection(device)
+    configure_hf_hub_access(hf_token)
+
+    full_cache_path: Path | None = None
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        full_cache_path = cache_dir / f"segments_stable-ts_{model_name}_{resolved_device}.json"
+        if full_cache_path.exists():
+            cached = load_segments_from_json(full_cache_path)
+            if cached and cached[0].start_s <= 7.0:
+                return cached
+            if status_callback is not None:
+                status_callback("[resume] stable-ts ASR cache starts too late; rebuilding...")
+
+    if status_callback is not None:
+        status_callback(
+            f"[stable-ts] Loading model '{model_name}' on {resolved_device.upper()} "
+            "(first use may download weights)..."
+        )
+
+    def _load_model(target_device: str, target_model: str) -> Any:
+        return stable_whisper.load_faster_whisper(
+            target_model,
+            device=target_device,
+            compute_type=preferred_whisper_compute_type(target_model, target_device),
+        )
+
+    active_device = resolved_device
+    active_model = model_name
+    try:
+        model = _load_model(active_device, active_model)
+    except Exception as exc:
+        if active_device == "cuda" and is_cuda_runtime_error(exc):
+            fallback_model = cpu_fallback_whisper_model(active_model)
+            if status_callback is not None:
+                status_callback(
+                    f"[stable-ts] CUDA unavailable ({exc}). "
+                    f"Retrying on CPU with '{fallback_model}'..."
+                )
+            logging.info("stable-ts CUDA load failed (%s). Retrying on CPU with '%s'.", exc, fallback_model)
+            active_device = "cpu"
+            active_model = fallback_model
+            model = _load_model(active_device, active_model)
+        else:
+            raise
+
+    def transcribe_chunk(path: Path, offset_s: float = 0.0) -> List[Segment]:
+        nonlocal model, active_device, active_model
+        if status_callback is not None:
+            status_callback(f"[stable-ts] Transcribing '{path.name}'...")
+        try:
+            result = model.transcribe(str(path), word_timestamps=True, vad=False)
+        except Exception as exc:
+            if active_device == "cuda" and is_cuda_runtime_error(exc):
+                fallback_model = cpu_fallback_whisper_model(active_model)
+                if status_callback is not None:
+                    status_callback(
+                        f"[stable-ts] CUDA runtime error during transcription. "
+                        f"Retrying on CPU with '{fallback_model}'..."
+                    )
+                logging.info(
+                    "stable-ts CUDA transcription failed (%s). Retrying on CPU with '%s'.", exc, fallback_model
+                )
+                active_device = "cpu"
+                active_model = fallback_model
+                model = _load_model(active_device, active_model)
+                result = model.transcribe(str(path), word_timestamps=True, vad=False)
+            else:
+                raise
+        segs: List[Segment] = []
+        for seg in result.segments:
+            text = safe_text(getattr(seg, "text", "")).strip()
+            if not text:
+                continue
+            start_s = float(getattr(seg, "start", 0.0)) + offset_s
+            end_s = float(getattr(seg, "end", 0.0)) + offset_s
+            if end_s <= start_s + 0.09:
+                continue
+            segs.append(Segment(start_s=start_s, end_s=end_s, source_text=text))
+        return segs
+
+    audio_duration_s = len(AudioSegment.from_wav(audio_path)) / 1000.0
+    should_chunk = chunk_length_s is not None and audio_duration_s > max(chunk_length_s * 1.15, 90.0)
+
+    if should_chunk and chunk_length_s is not None:
+        all_segments: List[Segment] = []
+        # Non-overlapping chunks: stable-ts timestamp accuracy avoids the need for overlap.
+        step_s = chunk_length_s
+        total_chunks = max(int((audio_duration_s - 0.001) // step_s) + 1, 1)
+
+        for chunk_index in range(total_chunks):
+            chunk_start_s = min(chunk_index * step_s, max(audio_duration_s - 1.0, 0.0))
+            chunk_end_s = min(chunk_start_s + step_s, audio_duration_s)
+            if chunk_end_s <= chunk_start_s + 0.1:
+                continue
+
+            chunk_json_path = (
+                cache_dir / f"asr_stable_chunk_{chunk_index + 1:04d}.json"
+                if cache_dir is not None
+                else None
+            )
+            if chunk_json_path is not None and chunk_json_path.exists():
+                chunk_segs = load_segments_from_json(chunk_json_path)
+            else:
+                chunk_wav = (
+                    cache_dir / f"asr_stable_chunk_{chunk_index + 1:04d}.wav"
+                    if cache_dir is not None
+                    else audio_path.parent / f"asr_stable_chunk_{chunk_index + 1:04d}.wav"
+                )
+                run_cmd([
+                    "ffmpeg", "-y", "-i", str(audio_path),
+                    "-ss", f"{chunk_start_s:.3f}", "-to", f"{chunk_end_s:.3f}",
+                    "-acodec", "pcm_s16le", str(chunk_wav),
+                ])
+                chunk_segs = transcribe_chunk(chunk_wav, offset_s=chunk_start_s)
+                if chunk_json_path is not None:
+                    save_segments_to_json(chunk_segs, chunk_json_path)
+
+            all_segments.extend(chunk_segs)
+            if chunk_progress_callback is not None:
+                chunk_progress_callback(chunk_index + 1, total_chunks)
+
+        all_segments.sort(key=lambda s: s.start_s)
+        # Collapse any near-duplicate entries produced at chunk boundaries.
+        all_segments = collapse_consecutive_duplicate_segments(all_segments, max_gap_s=0.05)
+        if full_cache_path is not None:
+            save_segments_to_json(all_segments, full_cache_path)
+        return all_segments
+
+    segments = transcribe_chunk(audio_path)
+    if full_cache_path is not None:
+        save_segments_to_json(segments, full_cache_path)
+    return segments
+
+
 def transcribe_segments(
     audio_path: Path,
     model_name: str,
@@ -613,7 +825,30 @@ def transcribe_segments(
     chunk_progress_callback: Callable[[int, int], None] | None = None,
     status_callback: Callable[[str], None] | None = None,
     hf_token: str | None = None,
+    asr_engine: str = "whisper",
 ) -> List[Segment]:
+    if asr_engine == "stable-ts":
+        if not stable_ts_available():
+            logging.warning(
+                "stable-ts is not installed (pip install stable-ts). "
+                "Falling back to standard Whisper for this job."
+            )
+            if status_callback is not None:
+                status_callback(
+                    "[asr] stable-ts not found, falling back to Whisper. "
+                    "Install it with: pip install stable-ts"
+                )
+        else:
+            return _transcribe_with_stable_ts(
+                audio_path=audio_path,
+                model_name=model_name,
+                device=device,
+                chunk_length_s=chunk_length_s,
+                cache_dir=cache_dir,
+                chunk_progress_callback=chunk_progress_callback,
+                status_callback=status_callback,
+                hf_token=hf_token,
+            )
     resolved_device = resolve_device_selection(device)
     active_device = resolved_device
     active_model_name = model_name
@@ -701,7 +936,7 @@ def transcribe_segments(
                 continue
 
             # Keep richer relaxed segment when it clearly carries more content.
-            best = max(overlaps, key=lambda seg: seg.end_s - seg.start_s)
+            best = max(overlaps, key=lambda seg: seg.end_s - seg.start_s)  # type: ignore[union-attr]
             best_dur = best.end_s - best.start_s
             cand_dur = cand.end_s - cand.start_s
             if cand_dur >= best_dur * 1.35 and len(cand.source_text) >= len(best.source_text) + 8:
@@ -1116,17 +1351,6 @@ def safe_translate(
     return normalized
 
 
-def translate_segments(
-    segments: Iterable[Segment],
-    target_lang: str,
-    translation_provider: str = "google",
-) -> None:
-    translator = build_translator(translation_provider, source="auto", target=target_lang)
-    segment_items = list(segments)
-    for seg in tqdm(segment_items, desc="Translating"):
-        seg.translated_text = translator.translate(seg.source_text)
-
-
 def translate_segments_with_progress(
     segments: List[Segment],
     target_lang: str,
@@ -1353,30 +1577,6 @@ def stretch_audio_preserve_pitch(audio: AudioSegment, speed: float, temp_dir: Pa
     )
 
     return AudioSegment.from_wav(out_wav)
-
-
-def fit_audio_to_duration(audio: AudioSegment, target_ms: int, temp_dir: Path, segment_index: int) -> AudioSegment:
-    """Fit audio into target slot while avoiding robotic speed and pitch artifacts."""
-    if target_ms <= 0:
-        return AudioSegment.silent(duration=0)
-
-    current_ms = len(audio)
-    if current_ms <= 0:
-        return AudioSegment.silent(duration=target_ms)
-
-    required_speed = current_ms / max(target_ms, 1)
-    clamped_speed = min(max(required_speed, 0.85), 1.20)
-
-    if abs(clamped_speed - 1.0) > 0.03:
-        audio = stretch_audio_preserve_pitch(audio, clamped_speed, temp_dir, f"seg_{segment_index:05d}")
-
-    if len(audio) > target_ms:
-        fade_ms = min(80, max(target_ms // 6, 20))
-        clipped = cast(AudioSegment, audio[:target_ms])
-        return clipped.fade_out(fade_ms)
-    if len(audio) < target_ms:
-        return audio + AudioSegment.silent(duration=target_ms - len(audio))
-    return audio
 
 
 def trim_segment_silence(audio: AudioSegment, trim_ms: int) -> AudioSegment:
@@ -1681,6 +1881,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional glossary override file with 'source => replacement' rules",
     )
+    parser.add_argument(
+        "--asr-engine",
+        default="whisper",
+        choices=["whisper", "stable-ts"],
+        help="Speech recognition engine: 'whisper' (default) or 'stable-ts' for better timestamp accuracy and opening coverage",
+    )
     return parser.parse_args()
 
 
@@ -1703,6 +1909,7 @@ def autodub_video(
     export_srt: bool = True,
     resume_enabled: bool = True,
     glossary_text: str = "",
+    asr_engine: str = "whisper",
     start_time_s: float = 0.0,
     end_time_s: float | None = None,
     keep_temp: bool = False,
@@ -1761,6 +1968,7 @@ def autodub_video(
                 start_time_s=start_time_s,
                 end_time_s=end_time_s,
                 glossary_text=glossary_text,
+                asr_engine=asr_engine,
             )
             resume_dir.mkdir(parents=True, exist_ok=True)
             report(f"[resume] Cache directory: {resume_dir}")
@@ -1820,20 +2028,21 @@ def autodub_video(
             extract_audio(working_video, extracted_wav)
             report_progress(0.10, "Audio extracted")
 
-        report("[2/5] Transcribing with Whisper...")
+        _asr_label = "stable-ts" if asr_engine == "stable-ts" else "Whisper"
+        report(f"[2/5] Transcribing with {_asr_label}...")
+
+        def asr_chunk_progress(done: int, total: int) -> None:
+            start = 0.12
+            end = 0.35
+            fraction = done / max(total, 1)
+            report_progress(start + (end - start) * fraction, f"Transcribing chunks ({done}/{total})")
+
         if segments_json.exists():
             segments = load_segments_from_json(segments_json)
             report(f"[resume] Reusing cached segments ({len(segments)} segments)...")
             if has_weak_opening_coverage(segments):
                 report("[resume] Cached ASR seems to miss opening speech; rebuilding transcription...")
                 report_progress(0.12, "Re-transcribing opening coverage")
-
-                def asr_chunk_progress(done: int, total: int) -> None:
-                    start = 0.12
-                    end = 0.35
-                    fraction = done / max(total, 1)
-                    report_progress(start + (end - start) * fraction, f"Transcribing chunks ({done}/{total})")
-
                 segments = transcribe_segments(
                     extracted_wav,
                     cast(str, resolved_settings["whisper_model"]),
@@ -1843,19 +2052,13 @@ def autodub_video(
                     chunk_progress_callback=asr_chunk_progress,
                     status_callback=report,
                     hf_token=hf_token,
+                    asr_engine=asr_engine,
                 )
                 save_segments_to_json(segments, segments_json)
 
             report_progress(0.35, f"Transcription complete ({len(segments)} segments)")
         else:
             report_progress(0.12, "Transcribing speech")
-
-            def asr_chunk_progress(done: int, total: int) -> None:
-                start = 0.12
-                end = 0.35
-                fraction = done / max(total, 1)
-                report_progress(start + (end - start) * fraction, f"Transcribing chunks ({done}/{total})")
-
             segments = transcribe_segments(
                 extracted_wav,
                 cast(str, resolved_settings["whisper_model"]),
@@ -1865,6 +2068,7 @@ def autodub_video(
                 chunk_progress_callback=asr_chunk_progress,
                 status_callback=report,
                 hf_token=hf_token,
+                asr_engine=asr_engine,
             )
             save_segments_to_json(segments, segments_json)
             report_progress(0.35, f"Transcription complete ({len(segments)} segments)")
@@ -2019,6 +2223,7 @@ def main() -> int:
         export_srt=not args.no_export_srt,
         resume_enabled=not args.no_resume,
         glossary_text=glossary_text,
+        asr_engine=args.asr_engine,
     )
 
 

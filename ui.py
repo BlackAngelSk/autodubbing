@@ -68,141 +68,14 @@ ASR_ENGINE_CHOICES = [
     ("stable-ts (accurate timestamps, fixes missed opening)", "stable-ts"),
 ]
 
-LARGE_WHISPER_MODELS = {"large-v2", "large-v3", "large-v3-turbo", "distil-large-v3"}
 AUTO_DEVICE = "cuda" if detect_cuda_available() else ("rocm" if detect_rocm_available() else "cpu")
 
 
-APP_CSS = """
-:root {
-    --ad-bg: #f4f6fb;
-    --ad-panel: #ffffff;
-    --ad-text: #111827;
-    --ad-muted: #374151;
-    --ad-border: #cbd5e1;
-    --ad-input-bg: #ffffff;
-    --ad-input-text: #111827;
-    --ad-accent: #2563eb;
-    --ad-accent-text: #ffffff;
-    --ad-option-bg: #f8fafc;
-    --ad-option-text: #111827;
-}
 
-html.ad-dark,
-body.ad-dark {
-    --ad-bg: #0b1220;
-    --ad-panel: #111827;
-    --ad-text: #f3f4f6;
-    --ad-muted: #d1d5db;
-    --ad-border: #334155;
-    --ad-input-bg: #0f172a;
-    --ad-input-text: #f8fafc;
-    --ad-accent: #3b82f6;
-    --ad-accent-text: #ffffff;
-    --ad-option-bg: #1e293b;
-    --ad-option-text: #f8fafc;
-}
-
-.gradio-container {
-    background: var(--ad-bg) !important;
-    color: var(--ad-text) !important;
-
-    --body-background-fill: var(--ad-bg);
-    --body-text-color: var(--ad-text);
-    --body-text-color-subdued: var(--ad-muted);
-    --background-fill-primary: var(--ad-bg);
-    --background-fill-secondary: var(--ad-panel);
-    --block-background-fill: var(--ad-panel);
-    --block-border-color: var(--ad-border);
-    --block-title-text-color: var(--ad-text);
-    --block-label-text-color: var(--ad-text);
-    --block-info-text-color: var(--ad-muted);
-    --input-background-fill: var(--ad-input-bg);
-    --input-border-color: var(--ad-border);
-    --input-text-color: var(--ad-input-text);
-    --input-placeholder-color: var(--ad-muted);
-    --button-primary-background-fill: var(--ad-accent);
-    --button-primary-text-color: var(--ad-accent-text);
-    --button-secondary-background-fill: var(--ad-option-bg);
-    --button-secondary-text-color: var(--ad-option-text);
-    --button-secondary-border-color: var(--ad-border);
-}
-
-#theme-mode {
-    border: 1px solid var(--ad-border);
-    border-radius: 10px;
-    padding: 8px;
-    background: var(--ad-panel);
-}
-
-#theme-mode label {
-    font-size: 12px;
-    color: var(--ad-text);
-}
-
-/* Force option text visibility in setting button groups/radios. */
-.gradio-container .gradio-radio label,
-.gradio-container .gradio-radio label *,
-.gradio-container .gradio-checkbox label,
-.gradio-container .gradio-checkbox label * {
-    color: var(--ad-option-text) !important;
-    opacity: 1 !important;
-}
-
-.gradio-container .gradio-radio label {
-    background: var(--ad-option-bg) !important;
-    border: 1px solid var(--ad-border) !important;
-}
-
-.gradio-container .gradio-radio label:has(input:checked),
-.gradio-container .gradio-radio label[aria-pressed="true"],
-.gradio-container button[aria-pressed="true"] {
-    background: var(--ad-accent) !important;
-    border-color: var(--ad-accent) !important;
-}
-
-.gradio-container .gradio-radio label:has(input:checked) *,
-.gradio-container .gradio-radio label[aria-pressed="true"] *,
-.gradio-container button[aria-pressed="true"] * {
-    color: var(--ad-accent-text) !important;
-}
-
-.gradio-container .info,
-.gradio-container .hint,
-.gradio-container [data-testid="block-info"],
-.gradio-container [class*="description"] {
-    color: var(--ad-muted) !important;
-    opacity: 1 !important;
-}
-"""
 
 
 def voice_for_language(lang: str) -> str:
     return DEFAULT_EDGE_VOICES.get(lang, DEFAULT_EDGE_VOICES["en"])
-
-
-def build_runtime_note(
-    whisper_model: str,
-    device: str,
-    optimization_profile: str,
-    tts_engine: str,
-) -> str:
-    resolved_device = AUTO_DEVICE if device == "auto" else device
-    speed_label = "fast" if whisper_model in {"tiny", "base"} else "balanced" if whisper_model in {"small", "medium", "distil-large-v3"} else "slowest"
-
-    lines = [
-        f"Auto-detected hardware target: `{AUTO_DEVICE}`.",
-        f"Expected transcription pace: **{speed_label}**.",
-        f"Optimization profile: `{optimization_profile}`.",
-    ]
-    if whisper_model in LARGE_WHISPER_MODELS:
-        lines.append("First use of this model may download several GB of Whisper weights.")
-        lines.append("Optional: set `HF_TOKEN` or paste a Hugging Face token below to avoid the auth warning and improve rate limits.")
-    if resolved_device not in {"cuda", "rocm"} and whisper_model in LARGE_WHISPER_MODELS:
-        lines.append("Large Whisper models on CPU can take a long time; `medium` is usually the safer fallback.")
-    if tts_engine != "edge":
-        lines.append("`gtts` is simpler but usually sounds less natural than `edge`.")
-
-    return "### Smart guidance\n" + "\n".join(f"- {line}" for line in lines)
 
 
 def _update_edge_voice_dropdown(lang: str, tts_engine: str) -> gr.Dropdown:
@@ -213,7 +86,7 @@ def _update_edge_voice_dropdown(lang: str, tts_engine: str) -> gr.Dropdown:
     )
 
 
-def on_quality_preset_change(preset: str, tts_engine: str) -> tuple[gr.Dropdown, gr.Dropdown, gr.Radio, gr.Markdown]:
+def on_quality_preset_change(preset: str, tts_engine: str) -> tuple[gr.Dropdown, gr.Dropdown, gr.Radio]:
     if preset == "fast":
         whisper_value = "base"
         profile_value = "long"
@@ -238,18 +111,8 @@ def on_quality_preset_change(preset: str, tts_engine: str) -> tuple[gr.Dropdown,
             ],
             value=profile_value,
         ),
-        gr.Radio(choices=["auto", "cpu", "cuda"], value=device_value),
-        gr.Markdown(value=build_runtime_note(whisper_value, device_value, profile_value, tts_engine)),
+        gr.Radio(choices=["auto", "cpu", "cuda", "rocm"], value=device_value),
     )
-
-
-def on_settings_change(
-    whisper_model: str,
-    device: str,
-    optimization_profile: str,
-    tts_engine: str,
-) -> gr.Markdown:
-    return gr.Markdown(value=build_runtime_note(whisper_model, device, optimization_profile, tts_engine))
 
 
 def parse_optional_number(value: object, *, default: float | None) -> float | None:
@@ -423,185 +286,115 @@ def run_dub(
 
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Auto Dubbing Studio") as demo:
-        with gr.Row():
-            theme_mode = gr.Radio(
-                label="Theme",
-                choices=[("Light", "light"), ("Dark", "dark")],
-                value="light",
-                elem_id="theme-mode",
-                scale=1,
-            )
-
-        def keep_theme_value(mode: str) -> str:
-            return mode
-
-        gr.Markdown(
-            """
-# Auto Dubbing Studio
-Upload a video, choose target language, and generate a dubbed version.
-            """.strip()
-        )
+        gr.Markdown("# Auto Dubbing Studio\nUpload a video (or paste a YouTube URL), pick a language, and click **Generate**.")
 
         with gr.Row():
-            with gr.Column(scale=2):
-                input_video = gr.Video(label="1) Upload Video")
+            with gr.Column(scale=3):
+                input_video = gr.Video(label="Upload Video")
                 youtube_url = gr.Textbox(
-                    label="1b) Or Paste YouTube Link",
+                    label="Or paste a YouTube URL",
                     placeholder="https://www.youtube.com/watch?v=...",
                 )
-                run_button = gr.Button("2) Generate Dubbed Video", variant="primary")
-            with gr.Column(scale=1):
-                gr.Markdown("### 3) Settings")
-                with gr.Accordion("Core", open=True):
-                    quality_preset = gr.Radio(
-                        label="Quality Preset",
-                        choices=QUALITY_PRESET_CHOICES,
-                        value="balanced",
-                        info="Quickly choose fast, balanced, or best-quality defaults",
-                    )
-                    target_lang = gr.Dropdown(
-                        label="Target Language",
-                        choices=LANGUAGE_CHOICES,
-                        value="es",
-                        info="Pick the language for dubbed speech",
-                    )
-                    whisper_model = gr.Dropdown(
-                        label="Whisper Model",
-                        choices=WHISPER_MODEL_CHOICES,
-                        value="small",
-                        info="Larger models are more accurate; large-v3 is best on GPU",
-                    )
-                    asr_engine = gr.Radio(
-                        label="ASR Engine",
-                        choices=ASR_ENGINE_CHOICES,
-                        value="whisper",
-                        info="stable-ts fixes missed opening words and produces more precise timestamps. Install with: pip install stable-ts",
-                    )
-                    device = gr.Radio(
-                        label="Device",
-                        choices=["auto", "cpu", "cuda", "rocm"],
-                        value="auto",
-                        info=f"Auto currently resolves to {AUTO_DEVICE} on this machine",
-                    )
-                    optimization_profile = gr.Dropdown(
-                        label="Optimization Profile",
-                        choices=[
-                            ("Auto (recommended)", "auto"),
-                            ("Balanced", "balanced"),
-                            ("Short video quality", "short"),
-                            ("Long video stability", "long"),
-                        ],
-                        value="auto",
-                        info="Auto tunes for short clips or long videos",
-                    )
-                    hardware_hint = gr.Markdown(build_runtime_note("small", "auto", "auto", "edge"))
 
-                with gr.Accordion("Voice", open=True):
-                    tts_engine = gr.Radio(
-                        label="TTS Engine",
-                        choices=["edge", "gtts"],
-                        value="edge",
-                        info="Edge sounds more natural in most cases",
-                    )
-                    edge_voice = gr.Dropdown(
-                        label="Edge Voice",
-                        choices=EDGE_VOICE_CHOICES,
-                        value=voice_for_language("es"),
-                    )
+            with gr.Column(scale=2):
+                target_lang = gr.Dropdown(
+                    label="Target Language",
+                    choices=LANGUAGE_CHOICES,
+                    value="es",
+                )
+                quality_preset = gr.Radio(
+                    label="Quality Preset",
+                    choices=QUALITY_PRESET_CHOICES,
+                    value="balanced",
+                    info="Fast = quick; Balanced = default; Best Quality = slower and more accurate",
+                )
+                run_button = gr.Button("Generate Dubbed Video", variant="primary", size="lg")
 
-                with gr.Accordion("Translation", open=False):
-                    translation_provider = gr.Radio(
-                        label="Translation Provider",
-                        choices=TRANSLATION_PROVIDER_CHOICES,
-                        value="google",
-                        info="Google is the default; MyMemory is a good alternate when needed",
-                    )
-                    glossary_text = gr.Textbox(
-                        label="Glossary Overrides",
-                        lines=4,
-                        placeholder="death => smrti\nwar => vojna",
-                        value="",
-                        info="Optional forced translations, one rule per line",
-                    )
+        with gr.Accordion("Settings", open=False):
+            with gr.Row():
+                whisper_model = gr.Dropdown(
+                    label="Whisper Model",
+                    choices=WHISPER_MODEL_CHOICES,
+                    value="small",
+                )
+                device = gr.Radio(
+                    label="Device",
+                    choices=["auto", "cpu", "cuda", "rocm"],
+                    value="auto",
+                    info=f"Auto → {AUTO_DEVICE}",
+                )
+                optimization_profile = gr.Dropdown(
+                    label="Optimization Profile",
+                    choices=[
+                        ("Auto (recommended)", "auto"),
+                        ("Balanced", "balanced"),
+                        ("Short video quality", "short"),
+                        ("Long video stability", "long"),
+                    ],
+                    value="auto",
+                )
 
-                with gr.Accordion("Output", open=False):
-                    include_original_audio = gr.Checkbox(
-                        label="Keep original audio quietly in background",
-                        value=True,
-                        info="Turn off for dubbed voice only",
-                    )
-                    export_srt = gr.Checkbox(
-                        label="Export translated subtitles (.srt)",
-                        value=True,
-                    )
+            with gr.Row():
+                asr_engine = gr.Radio(
+                    label="ASR Engine",
+                    choices=ASR_ENGINE_CHOICES,
+                    value="whisper",
+                )
+                tts_engine = gr.Radio(
+                    label="TTS Engine",
+                    choices=["edge", "gtts"],
+                    value="edge",
+                    info="Edge sounds more natural in most cases",
+                )
+                edge_voice = gr.Dropdown(
+                    label="Edge Voice",
+                    choices=EDGE_VOICE_CHOICES,
+                    value=voice_for_language("es"),
+                )
 
-                with gr.Accordion("Advanced", open=False):
-                    hf_token = gr.Textbox(
-                        label="Hugging Face Token (optional)",
-                        type="password",
-                        placeholder="hf_...",
-                        info="Avoids the HF Hub auth warning and can improve Whisper download rate limits",
-                    )
-                    resume_enabled = gr.Checkbox(
-                        label="Resume previous job if possible",
-                        value=True,
-                        info="Reuses cached chunks and translations on reruns",
-                    )
-                    keep_temp = gr.Checkbox(label="Keep temp files", value=False)
+            with gr.Row():
+                translation_provider = gr.Radio(
+                    label="Translation Provider",
+                    choices=TRANSLATION_PROVIDER_CHOICES,
+                    value="google",
+                )
+                glossary_text = gr.Textbox(
+                    label="Glossary Overrides",
+                    lines=3,
+                    placeholder="death => morti\nwar => vojna",
+                    info="Optional forced translations, one per line",
+                )
 
-                with gr.Accordion("Custom Time Range", open=False):
-                    use_time_range = gr.Checkbox(
-                        label="Enable custom time range",
-                        value=False,
-                        info="Turn on to dub only a selected part of the video",
-                    )
-                    start_time_s = gr.Number(
-                        label="Start Time (seconds)",
-                        value=0,
-                        precision=0,
-                        info="Set start point for dubbing window",
-                    )
-                    end_time_s = gr.Number(
-                        label="End Time (seconds, optional)",
-                        value=None,
-                        precision=0,
-                        info="Leave empty to dub until video end",
-                    )
+            with gr.Row():
+                include_original_audio = gr.Checkbox(label="Keep original audio in background", value=True)
+                export_srt = gr.Checkbox(label="Export subtitles (.srt)", value=True)
+                resume_enabled = gr.Checkbox(label="Resume previous job", value=True)
+                keep_temp = gr.Checkbox(label="Keep temp files", value=False)
+
+            with gr.Row():
+                hf_token = gr.Textbox(
+                    label="Hugging Face Token (optional)",
+                    type="password",
+                    placeholder="hf_...",
+                )
+                use_time_range = gr.Checkbox(label="Custom time range", value=False)
+                start_time_s = gr.Number(label="Start (seconds)", value=0, precision=0)
+                end_time_s = gr.Number(label="End (seconds, optional)", value=None, precision=0)
+
+        with gr.Row():
+            output_video = gr.Video(label="Dubbed Output")
+            output_srt = gr.File(label="Subtitle File (.srt)")
+
+        status = gr.Textbox(label="Status", interactive=False)
+        logs = gr.Textbox(label="Logs", lines=10, interactive=False)
 
         target_lang.change(fn=_update_edge_voice_dropdown, inputs=[target_lang, tts_engine], outputs=[edge_voice])
         tts_engine.change(fn=_update_edge_voice_dropdown, inputs=[target_lang, tts_engine], outputs=[edge_voice])
         quality_preset.change(
             fn=on_quality_preset_change,
             inputs=[quality_preset, tts_engine],
-            outputs=[whisper_model, optimization_profile, device, hardware_hint],
+            outputs=[whisper_model, optimization_profile, device],
         )
-        whisper_model.change(
-            fn=on_settings_change,
-            inputs=[whisper_model, device, optimization_profile, tts_engine],
-            outputs=[hardware_hint],
-        )
-        device.change(
-            fn=on_settings_change,
-            inputs=[whisper_model, device, optimization_profile, tts_engine],
-            outputs=[hardware_hint],
-        )
-        optimization_profile.change(
-            fn=on_settings_change,
-            inputs=[whisper_model, device, optimization_profile, tts_engine],
-            outputs=[hardware_hint],
-        )
-        tts_engine.change(
-            fn=on_settings_change,
-            inputs=[whisper_model, device, optimization_profile, tts_engine],
-            outputs=[hardware_hint],
-        )
-
-        with gr.Row():
-            output_video = gr.Video(label="4) Dubbed Output")
-            output_srt = gr.File(label="5) Subtitle File (.srt)")
-
-        status = gr.Textbox(label="Status", interactive=False)
-        logs = gr.Textbox(label="Logs", lines=12, interactive=False)
 
         run_button.click(
             fn=run_dub,
@@ -629,45 +422,13 @@ Upload a video, choose target language, and generate a dubbed version.
             outputs=[output_video, status, logs, output_srt],
         )
 
-        demo.load(
-            fn=lambda: "light",
-            inputs=None,
-            outputs=[theme_mode],
-            js="""
-() => {
-    const key = 'autodub-theme-mode';
-    const saved = localStorage.getItem(key) === 'dark' ? 'dark' : 'light';
-    const dark = saved === 'dark';
-    document.documentElement.classList.toggle('ad-dark', dark);
-    document.body.classList.toggle('ad-dark', dark);
-    return [saved];
-}
-            """,
-        )
-
-        theme_mode.change(
-            fn=keep_theme_value,
-            inputs=[theme_mode],
-            outputs=[theme_mode],
-            js="""
-(mode) => {
-    const normalized = mode === 'dark' ? 'dark' : 'light';
-    const dark = normalized === 'dark';
-    document.documentElement.classList.toggle('ad-dark', dark);
-    document.body.classList.toggle('ad-dark', dark);
-    localStorage.setItem('autodub-theme-mode', normalized);
-    return [normalized];
-}
-            """,
-        )
-
     return demo
 
 
 def main() -> None:
     app = build_ui()
     app.queue(default_concurrency_limit=1)
-    app.launch(server_name="127.0.0.1", server_port=7860, show_error=True, css=APP_CSS)
+    app.launch(server_name="127.0.0.1", server_port=7860, show_error=True)
 
 
 if __name__ == "__main__":

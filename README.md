@@ -124,16 +124,17 @@ UI flow:
    - `Short video quality` for clips/songs
    - `Long video stability` for longer videos
 5. Keep `TTS Engine` on `edge` for more natural neural speech.
-6. Optionally switch `Translation Provider` between `Google` and `MyMemory`.
-7. Choose an `Edge Voice` (auto-updates when language changes).
-8. Optionally enable:
+6. Leave `ASR Engine` on `Auto` unless you need to force Whisper compatibility.
+7. Optionally switch `Translation Provider` between `Google` and `MyMemory`.
+8. Choose an `Edge Voice` (auto-updates when language changes).
+9. Optionally enable:
    - `Keep original audio quietly in background` (turn off for dubbed voice only)
    - `Export translated subtitles (.srt)`
    - `Resume previous job if possible`
    - `Glossary Overrides` like `death => smrti`
-9. Optionally set `Start Time` and `End Time` to dub only a part of the video.
-10. Click **Generate Dubbed Video**.
-11. Preview output, download the generated `.srt`, and read logs.
+10. Optionally set `Start Time` and `End Time` to dub only a part of the video.
+11. Click **Generate Dubbed Video**.
+12. Preview output, download the generated `.srt`, and read logs.
 
 Generated videos are saved in `outputs/`, and resume caches are stored under `outputs/.autodub_resume/`.
 
@@ -167,6 +168,7 @@ Optional arguments:
 - `--keep-temp` keep intermediate files for debugging
 - `--disable-original-audio` output dubbed speech only (no original source audio mixed in)
 - `--optimization-profile` choose `auto`, `balanced`, `short`, or `long`
+- `--asr-engine` values: `auto` (default, prefers `stable-ts` when available), `whisper`, `stable-ts`
 - `--no-export-srt` skip translated `.srt` output
 - `--no-resume` disable resume-cache reuse
 - `--glossary-file` load glossary overrides from a text file
@@ -204,6 +206,7 @@ If `--keep-temp` is passed, the script will show the temp directory path so you 
 ## Troubleshooting
 
 - If transcription is slow, try `--whisper-model base`.
+- For the best speech pickup, keep `--asr-engine auto`; it now prefers `stable-ts` and uses a higher-recall Whisper fallback path.
 - For best transcription quality on a capable GPU, try `--whisper-model large-v3`.
 - The first run of larger Whisper models may download several GB of weights.
 - If you see an HF Hub unauthenticated warning, set `HF_TOKEN` in your shell or paste it into the UI's optional token field.

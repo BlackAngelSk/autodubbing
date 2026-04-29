@@ -53,7 +53,7 @@ LARGE_WHISPER_MODELS = {
 }
 
 TRANSLATION_PROVIDERS = {"google", "mymemory"}
-ASR_ENGINE_CHOICES = {"whisper", "stable-ts"}
+ASR_ENGINE_CHOICES = {"auto", "whisper", "stable-ts"}
 HF_UNAUTH_WARNING_TEXT = "unauthenticated requests to the hf hub"
 
 
@@ -408,6 +408,89 @@ def cached_translation_looks_poor(segments: Iterable[Segment], target_lang: str)
     return unchanged_ratio > 0.35 or empty_ratio > 0.12
 
 
+def translation_looks_wrong_language(segments: Iterable[Segment], target_lang: str) -> bool:
+    if target_lang == "en":
+        return False
+
+    stopword_hints: dict[str, set[str]] = {
+        "es": {"el", "la", "los", "las", "que", "de", "por", "para", "con", "una", "un", "como"},
+        "fr": {"le", "la", "les", "des", "une", "que", "pour", "avec", "pas", "est", "dans"},
+        "de": {"der", "die", "das", "und", "nicht", "mit", "ist", "für", "ein", "eine", "ich"},
+        "pt": {"de", "do", "da", "que", "para", "com", "não", "uma", "um", "como", "você"},
+        "sk": {"som", "si", "je", "sme", "ste", "sa", "že", "ako", "čo", "pre", "to", "nie"},
+        "ru": {"и", "в", "не", "на", "что", "это", "как", "для", "с", "я", "ты"},
+        "hi": {"है", "और", "नहीं", "के", "यह", "से", "मैं", "आप", "हम", "क्या"},
+        "ja": {"です", "ます", "して", "ない", "する", "これ", "それ", "から", "まで", "よう"},
+    }
+    script_patterns: dict[str, str] = {
+        "ru": r"[А-Яа-яЁё]",
+        "hi": r"[\u0900-\u097F]",
+        "ja": r"[\u3040-\u30FF\u4E00-\u9FFF]",
+    }
+    english_hints = {
+        "the", "and", "you", "that", "this", "with", "for", "not", "are", "was", "have", "will", "what",
+        "your", "from", "they", "can", "about", "just", "like", "there",
+    }
+
+    target_hints = stopword_hints.get(target_lang, set())
+    script_pattern = script_patterns.get(target_lang)
+
+    items = [seg for seg in segments if safe_text(seg.translated_text).strip()]
+    if not items:
+        return True
+
+    checked = 0
+    unchanged = 0
+    english_like = 0
+    target_like = 0
+
+    for seg in items:
+        source_clean = re.sub(r"\s+", " ", safe_text(seg.source_text)).strip().lower()
+        text = safe_text(seg.translated_text).strip().lower()
+        if len(text) < 8:
+            continue
+
+        checked += 1
+        if source_clean and source_clean == text:
+            unchanged += 1
+
+        target_match = False
+        if script_pattern is not None and re.search(script_pattern, text):
+            target_match = True
+
+        latin_tokens = re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ']+", text)
+        en_hits = sum(1 for token in latin_tokens if token in english_hints)
+        target_hits = sum(1 for token in latin_tokens if token in target_hints)
+
+        if target_hits >= 1:
+            target_match = True
+
+        if target_match:
+            target_like += 1
+        if en_hits >= 2:
+            english_like += 1
+
+    if checked <= 0:
+        return True
+
+    unchanged_ratio = unchanged / checked
+    english_ratio = english_like / checked
+    target_ratio = target_like / checked
+
+    if unchanged_ratio >= 0.55:
+        return True
+
+    if script_pattern is not None:
+        return target_ratio < 0.30
+
+    if target_hints:
+        if target_ratio >= 0.28:
+            return False
+        return english_ratio >= 0.50 or unchanged_ratio >= 0.35
+
+    return unchanged_ratio >= 0.45
+
+
 def build_translator(provider: str, source: str, target: str) -> Any:
     normalized = provider.strip().lower() if provider else "google"
     if normalized not in TRANSLATION_PROVIDERS:
@@ -669,6 +752,24 @@ def stable_ts_available() -> bool:
         return False
 
 
+def resolve_asr_engine(asr_engine: str | None, status_callback: Callable[[str], None] | None = None) -> str:
+    normalized = safe_text(asr_engine).strip().lower() or "auto"
+    if normalized not in ASR_ENGINE_CHOICES:
+        raise ValueError(f"Unsupported ASR engine: {asr_engine}")
+
+    if normalized != "auto":
+        return normalized
+
+    if stable_ts_available():
+        if status_callback is not None:
+            status_callback("[asr] Auto-selected stable-ts for stronger speech detection and timestamp alignment.")
+        return "stable-ts"
+
+    if status_callback is not None:
+        status_callback("[asr] stable-ts is unavailable; falling back to Whisper.")
+    return "whisper"
+
+
 def _transcribe_with_stable_ts(
     audio_path: Path,
     model_name: str,
@@ -825,9 +926,11 @@ def transcribe_segments(
     chunk_progress_callback: Callable[[int, int], None] | None = None,
     status_callback: Callable[[str], None] | None = None,
     hf_token: str | None = None,
-    asr_engine: str = "whisper",
+    asr_engine: str = "auto",
 ) -> List[Segment]:
-    if asr_engine == "stable-ts":
+    resolved_asr_engine = resolve_asr_engine(asr_engine, status_callback=status_callback)
+
+    if resolved_asr_engine == "stable-ts":
         if not stable_ts_available():
             logging.warning(
                 "stable-ts is not installed (pip install stable-ts). "
@@ -960,12 +1063,13 @@ def transcribe_segments(
             looks_like_continuation = (
                 (prev_text and prev_text[-1] not in ".!?;:")
                 or (next_text[:1].islower() if next_text else False)
-                or gap_s <= 0.05
+                or gap_s <= 0.10
+                or (len(prev_text.split()) <= 5 and len(next_text.split()) <= 6)
             )
             should_merge = (
-                gap_s <= 0.16
-                and combined_duration_s <= 8.5
-                and (prev_duration_s <= 0.65 or looks_like_continuation)
+                gap_s <= 0.30
+                and combined_duration_s <= 11.0
+                and (prev_duration_s <= 1.15 or looks_like_continuation)
             )
             if not should_merge:
                 merged.append(seg)
@@ -990,6 +1094,24 @@ def transcribe_segments(
             "beam_size": 1,
             "best_of": 1,
         }
+        if vad_filter:
+            if relaxed:
+                transcribe_kwargs["vad_parameters"] = {
+                    "threshold": 0.26,
+                    "neg_threshold": 0.18,
+                    "min_speech_duration_ms": 70,
+                    "min_silence_duration_ms": 140,
+                    "speech_pad_ms": 360,
+                }
+                transcribe_kwargs["no_speech_threshold"] = 0.88
+            else:
+                transcribe_kwargs["vad_parameters"] = {
+                    "threshold": 0.34,
+                    "neg_threshold": 0.22,
+                    "min_speech_duration_ms": 110,
+                    "min_silence_duration_ms": 260,
+                    "speech_pad_ms": 280,
+                }
         if relaxed:
             # Favor recall for quiet/overlapped speech in the second pass.
             transcribe_kwargs["no_speech_threshold"] = 0.92
@@ -1132,16 +1254,22 @@ def transcribe_segments(
 
     def transcribe_single_audio(target_audio_path: Path) -> List[Segment]:
         primary_segments = collect_segments(target_audio_path, vad_filter=True)
+        recall_vad_segments = collect_segments(target_audio_path, vad_filter=True, relaxed=True)
         recall_segments = collect_segments(target_audio_path, vad_filter=False, relaxed=True)
 
         if primary_segments:
-            merged_segments = merge_recall_segments(primary_segments, recall_segments)
+            merged_segments = merge_recall_segments(primary_segments, recall_vad_segments)
+            merged_segments = merge_recall_segments(merged_segments, recall_segments)
             recovered = recover_tail_segments(merged_segments, target_audio_path)
             recovered = recover_head_segments(recovered, target_audio_path)
             return merge_tts_friendly_segments(recovered)
 
-        # If VAD pass found nothing, use relaxed no-VAD pass.
-        recovered = recover_tail_segments(recall_segments, target_audio_path)
+        # If the primary VAD pass found nothing, fall back to the most permissive passes.
+        fallback_segments = recall_vad_segments or recall_segments
+        if recall_vad_segments and recall_segments:
+            fallback_segments = merge_recall_segments(recall_vad_segments, recall_segments)
+
+        recovered = recover_tail_segments(fallback_segments, target_audio_path)
         recovered = recover_head_segments(recovered, target_audio_path)
         return merge_tts_friendly_segments(recovered)
 
@@ -1357,11 +1485,14 @@ def translate_segments_with_progress(
     segment_progress_callback: Callable[[int, int], None] | None = None,
     glossary_overrides: dict[str, str] | None = None,
     translation_provider: str = "google",
+    force_english_source: bool = False,
 ) -> None:
     normalized_provider = translation_provider.strip().lower() if translation_provider else "google"
     translator = build_translator(normalized_provider, source="auto", target=target_lang)
     fallback_provider = "mymemory" if normalized_provider == "google" else "google"
     fallback_translator = build_translator(fallback_provider, source="auto", target=target_lang)
+    explicit_en_translator = build_translator(normalized_provider, source="en", target=target_lang)
+    explicit_en_fallback_translator = build_translator(fallback_provider, source="en", target=target_lang)
     word_translator = build_translator("google", source="en", target=target_lang)
     translation_cache: dict[str, str] = {}
 
@@ -1389,13 +1520,40 @@ def translate_segments_with_progress(
         word_count = len(source_clean.split())
         return len(alpha_chars) >= 4 and word_count >= 2
 
-    def translate_source_text(source_text: str) -> str:
-        translated = safe_translate(source_text, translator, fallback_translator)
+    def looks_untranslated(source_text: str, translated_text: str) -> bool:
+        if target_lang == "en":
+            return False
 
-        if should_retry_with_english_source(source_text, translated) or has_untranslated_english_tokens(
-            source_text, translated, target_lang
-        ):
+        translated_clean = re.sub(r"\s+", " ", translated_text).strip()
+        if not translated_clean:
+            return True
+
+        if should_retry_with_english_source(source_text, translated_text):
+            return True
+
+        if has_untranslated_english_tokens(source_text, translated_text, target_lang):
+            return True
+
+        return False
+
+    def translate_source_text(source_text: str) -> str:
+        if force_english_source:
+            translated = safe_translate(source_text, explicit_en_translator, explicit_en_fallback_translator)
+        else:
+            translated = safe_translate(source_text, translator, fallback_translator)
+
+        if not force_english_source and looks_untranslated(source_text, translated):
+            retry = safe_translate(source_text, explicit_en_translator, explicit_en_fallback_translator)
+            if retry is not None and retry.strip():
+                translated = retry
+
+        if not force_english_source and looks_untranslated(source_text, translated):
             retry = safe_translate(source_text, fallback_translator, translator)
+            if retry is not None and retry.strip():
+                translated = retry
+
+        if looks_untranslated(source_text, translated):
+            retry = safe_translate(source_text, explicit_en_fallback_translator, explicit_en_translator)
             if retry is not None and retry.strip():
                 translated = retry
 
@@ -1473,12 +1631,25 @@ def translate_segments_with_progress(
         )
 
 
-def edge_tts_segment(text: str, voice: str, output_mp3: Path, rate: str = "+0%") -> None:
+def edge_tts_segment(
+    text: str,
+    voice: str,
+    output_mp3: Path,
+    rate: str = "+0%",
+    pitch: str = "+0Hz",
+    volume: str = "+0%",
+) -> None:
     edge_tts = importlib.import_module("edge_tts")
     configure_windows_asyncio_policy()
 
     async def synthesize() -> None:
-        communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate)
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice=voice,
+            rate=rate,
+            pitch=pitch,
+            volume=volume,
+        )
         await communicate.save(str(output_mp3))
 
     if os.name == "nt" and hasattr(asyncio, "SelectorEventLoop"):
@@ -1502,6 +1673,8 @@ def tts_segment(
     tts_engine: str = "edge",
     edge_voice: str | None = None,
     edge_rate: str = "+0%",
+    edge_pitch: str = "+0Hz",
+    edge_volume: str = "+0%",
 ) -> None:
     last_error: Exception | None = None
 
@@ -1509,7 +1682,14 @@ def tts_segment(
         voice = edge_voice or DEFAULT_EDGE_VOICES.get(lang, DEFAULT_EDGE_VOICES["en"])
         for attempt in range(3):
             try:
-                edge_tts_segment(text, voice, output_mp3, rate=edge_rate)
+                edge_tts_segment(
+                    text,
+                    voice,
+                    output_mp3,
+                    rate=edge_rate,
+                    pitch=edge_pitch,
+                    volume=edge_volume,
+                )
                 return
             except Exception as exc:
                 last_error = exc
@@ -1531,6 +1711,9 @@ def sanitize_tts_text(text: str) -> str:
     """Clean text so TTS gets stable, natural input."""
     cleaned = re.sub(r"\s+", " ", text).strip()
     cleaned = re.sub(r"([!?.,])\1{1,}", r"\1", cleaned)
+    cleaned = re.sub(r"\s*[-–—]\s*", ", ", cleaned)
+    cleaned = re.sub(r"\s*([,;:.!?])\s*", r"\1 ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
 
 
@@ -1539,6 +1722,57 @@ def format_edge_rate(percent: int) -> str:
     if bounded >= 0:
         return f"+{bounded}%"
     return f"{bounded}%"
+
+
+def format_edge_pitch(hz: int) -> str:
+    bounded = max(min(hz, 18), -12)
+    if bounded >= 0:
+        return f"+{bounded}Hz"
+    return f"{bounded}Hz"
+
+
+def inject_mid_sentence_pause(text: str) -> str:
+    if len(text) < 70 or re.search(r"[,;:!?]", text):
+        return text
+
+    midpoint = len(text) // 2
+    connector_matches = list(
+        re.finditer(r"\b(and|but|because|so|while|when|which|that|although|though)\b", text, flags=re.IGNORECASE)
+    )
+    if not connector_matches:
+        return text
+
+    split_at = min(connector_matches, key=lambda match: abs(match.start() - midpoint)).start()
+    if split_at < 24 or len(text) - split_at < 24:
+        return text
+    return f"{text[:split_at].rstrip()}, {text[split_at:].lstrip()}"
+
+
+def build_edge_tts_profile(text: str) -> tuple[str, int, int, str]:
+    spoken_text = inject_mid_sentence_pause(sanitize_tts_text(text))
+    word_count = len(spoken_text.split())
+    punctuation_count = len(re.findall(r"[,;:]", spoken_text))
+
+    rate_percent = 0
+    if word_count >= 16:
+        rate_percent = -8
+    elif word_count >= 10:
+        rate_percent = -5
+    elif word_count >= 6:
+        rate_percent = -3
+
+    if punctuation_count >= 2:
+        rate_percent -= 2
+
+    pitch_hz = 2
+    if spoken_text.endswith("?"):
+        pitch_hz = 10
+    elif spoken_text.endswith("!"):
+        pitch_hz = 7
+    elif word_count <= 4:
+        pitch_hz = 4
+
+    return spoken_text, rate_percent, pitch_hz, "+0%"
 
 
 def build_atempo_filter(speed: float) -> str:
@@ -1638,26 +1872,46 @@ def fit_audio_to_duration_with_controls(
     required_speed = current_ms / max(target_ms, 1)
     clamped_speed = min(max(required_speed, min_stretch_speed), max_stretch_speed)
 
-    if abs(clamped_speed - 1.0) > 0.03:
+    if abs(clamped_speed - 1.0) > 0.08:
         audio = stretch_audio_preserve_pitch(audio, clamped_speed, temp_dir, f"seg_{segment_index:05d}")
 
     # Safety pass: if audio is still too long, allow one extra stretch to avoid dropping words.
     if len(audio) > target_ms:
         overflow_speed = len(audio) / max(target_ms, 1)
-        if overflow_speed > 1.03:
+        if overflow_speed > 1.08:
             # Keep emergency compression bounded so a single difficult line does
             # not become unnaturally fast.
             safety_speed = min(max(overflow_speed, 1.0), max(max_stretch_speed + 0.18, 1.95))
-            if abs(safety_speed - 1.0) > 0.03:
+            if abs(safety_speed - 1.0) > 0.08:
                 audio = stretch_audio_preserve_pitch(audio, safety_speed, temp_dir, f"seg_{segment_index:05d}_safe")
 
     if len(audio) > target_ms:
         fade_ms = min(80, max(target_ms // 6, 20))
         clipped = cast(AudioSegment, audio[:target_ms])
         return clipped.fade_out(fade_ms)
-    if len(audio) < target_ms:
-        return audio + AudioSegment.silent(duration=target_ms - len(audio))
-    return audio
+    smoothed = audio.fade_in(min(22, max(len(audio) // 12, 10))).fade_out(min(48, max(len(audio) // 10, 18)))
+    if len(smoothed) < target_ms:
+        return smoothed + AudioSegment.silent(duration=target_ms - len(smoothed))
+    return smoothed
+
+
+def has_meaningful_audio(audio_path: Path, min_nonsilent_ms: int = 450) -> bool:
+    """Return True when audio contains enough non-silent content to be considered usable speech."""
+    if not audio_path.exists():
+        return False
+
+    try:
+        audio = AudioSegment.from_file(audio_path)
+    except Exception:
+        return False
+
+    if len(audio) <= 0:
+        return False
+
+    silence_floor = audio.dBFS - 18 if audio.dBFS != float("-inf") else -45
+    ranges = detect_nonsilent(audio, min_silence_len=120, silence_thresh=max(silence_floor, -45))
+    nonsilent_ms = sum(max(end - start, 0) for start, end in ranges)
+    return nonsilent_ms >= min_nonsilent_ms
 
 
 def build_dubbed_track(
@@ -1676,13 +1930,18 @@ def build_dubbed_track(
 ) -> AudioSegment:
     dubbed = AudioSegment.silent(duration=total_duration_ms)
     total = len(segments)
-    voice_cache: dict[tuple[str, str, str, str, str], AudioSegment] = {}
+    voice_cache: dict[tuple[str, str, str, str, str, str, str], AudioSegment] = {}
 
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_tts_audio(spoken_text: str, rate: str = "+0%") -> AudioSegment:
-        cache_key = (spoken_text, target_lang, tts_engine, edge_voice or "", rate)
+    def get_tts_audio(
+        spoken_text: str,
+        rate: str = "+0%",
+        pitch: str = "+0Hz",
+        volume: str = "+0%",
+    ) -> AudioSegment:
+        cache_key = (spoken_text, target_lang, tts_engine, edge_voice or "", rate, pitch, volume)
         cached_audio = voice_cache.get(cache_key)
         if cached_audio is not None:
             return cached_audio
@@ -1695,6 +1954,8 @@ def build_dubbed_track(
             tts_engine=tts_engine,
             edge_voice=edge_voice,
             edge_rate=rate,
+            edge_pitch=pitch,
+            edge_volume=volume,
         )
         cached_audio = AudioSegment.from_file(mp3_path)
         voice_cache[cache_key] = cached_audio
@@ -1703,12 +1964,13 @@ def build_dubbed_track(
     def synthesize_chunk(chunk_items: list[tuple[int, Segment]], chunk_start_ms: int, chunk_end_ms: int) -> AudioSegment:
         chunk_audio = AudioSegment.silent(duration=max(chunk_end_ms - chunk_start_ms, 120))
         for i, seg in chunk_items:
-            if not seg.translated_text:
+            line_text = safe_text(seg.translated_text).strip() or safe_text(seg.source_text).strip()
+            if not line_text:
                 if segment_progress_callback is not None:
                     segment_progress_callback(i, total)
                 continue
 
-            spoken_text = sanitize_tts_text(seg.translated_text)
+            spoken_text, base_rate_percent, pitch_hz, volume = build_edge_tts_profile(line_text)
             if not spoken_text:
                 if segment_progress_callback is not None:
                     segment_progress_callback(i, total)
@@ -1724,20 +1986,30 @@ def build_dubbed_track(
                 allowed_end_ms = total_duration_ms
             slot_ms = max(allowed_end_ms - global_start_ms, 120)
 
-            voice = get_tts_audio(spoken_text)
+            edge_rate_percent = base_rate_percent
+            if tts_engine == "edge" and slot_ms > 0:
+                desired_ratio = len(get_tts_audio(spoken_text, rate=format_edge_rate(base_rate_percent), pitch=format_edge_pitch(pitch_hz), volume=volume)) / slot_ms
+                if desired_ratio > 1.05:
+                    edge_rate_percent += int(min((desired_ratio - 1.0) * 52, 34))
+                elif desired_ratio < 0.78:
+                    edge_rate_percent -= int(min((1.0 - desired_ratio) * 16, 6))
+
+            edge_rate = format_edge_rate(edge_rate_percent)
+            edge_pitch = format_edge_pitch(pitch_hz)
+            voice = get_tts_audio(spoken_text, rate=edge_rate, pitch=edge_pitch, volume=volume)
 
             if tts_engine == "edge" and slot_ms > 0:
                 natural_ratio = len(voice) / slot_ms
                 if natural_ratio > max_stretch_speed + 0.12:
-                    adaptive_rate = format_edge_rate(int(min((natural_ratio - 1.0) * 36, 32)))
-                    voice = get_tts_audio(spoken_text, rate=adaptive_rate)
+                    adaptive_rate = format_edge_rate(edge_rate_percent + int(min((natural_ratio - 1.0) * 28, 24)))
+                    voice = get_tts_audio(spoken_text, rate=adaptive_rate, pitch=edge_pitch, volume=volume)
                     # Some lines still run long after one rate bump. Try one stronger pass
                     # rather than expanding the segment slot and drifting into the next line.
                     if len(voice) > slot_ms:
                         second_ratio = len(voice) / slot_ms
                         if second_ratio > max_stretch_speed + 0.08:
-                            stronger_rate = format_edge_rate(int(min((second_ratio - 1.0) * 40, 38)))
-                            voice = get_tts_audio(spoken_text, rate=stronger_rate)
+                            stronger_rate = format_edge_rate(edge_rate_percent + int(min((second_ratio - 1.0) * 34, 28)))
+                            voice = get_tts_audio(spoken_text, rate=stronger_rate, pitch=edge_pitch, volume=volume)
 
             voice = fit_audio_to_duration_with_controls(
                 voice,
@@ -1792,32 +2064,8 @@ def mux_video_with_dub(
     background_mix_level: float = 0.08,
     include_original_audio: bool = True,
 ) -> None:
-    if include_original_audio:
-        # Keep original ambience quietly under dubbed speech for more natural output.
-        mix = min(max(background_mix_level, 0.0), 1.0)
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_video),
-            "-i",
-            str(dubbed_wav),
-            "-filter_complex",
-            f"[0:a]volume={mix:.3f}[bg];[bg][1:a]amix=inputs=2:duration=first:normalize=0[aout]",
-            "-map",
-            "0:v",
-            "-map",
-            "[aout]",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-shortest",
-            str(output_video),
-        ]
-    else:
-        # Output dubbed speech only, preserving the original video stream.
-        cmd = [
+    def build_dub_only_cmd() -> list[str]:
+        return [
             "ffmpeg",
             "-y",
             "-i",
@@ -1836,7 +2084,71 @@ def mux_video_with_dub(
             str(output_video),
         ]
 
-    run_cmd(cmd)
+    if include_original_audio:
+        # Keep original ambience under the dub, but make dubbed speech dominant.
+        mix = min(max(background_mix_level, 0.0), 1.0)
+        advanced_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_video),
+            "-i",
+            str(dubbed_wav),
+            "-filter_complex",
+            (
+                f"[1:a]acompressor=threshold=-20dB:ratio=2.2:attack=15:release=140,"
+                f"alimiter=limit=0.97,volume=1.9[dub];"
+                f"[0:a]volume={mix:.3f}[bg];"
+                f"[bg][dub]sidechaincompress=threshold=0.025:ratio=10:attack=20:release=260:makeup=1[ducked];"
+                f"[ducked][dub]amix=inputs=2:weights='0.22 1.78':duration=first:normalize=0[aout]"
+            ),
+            "-map",
+            "0:v",
+            "-map",
+            "[aout]",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(output_video),
+        ]
+        simple_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_video),
+            "-i",
+            str(dubbed_wav),
+            "-filter_complex",
+            f"[0:a]volume={mix:.3f}[bg];[1:a]volume=1.9[dub];[bg][dub]amix=inputs=2:weights='0.24 1.76':duration=first:normalize=0[aout]",
+            "-map",
+            "0:v",
+            "-map",
+            "[aout]",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(output_video),
+        ]
+
+        try:
+            run_cmd(advanced_cmd)
+            return
+        except RuntimeError as exc:
+            logging.warning("Advanced audio ducking mix failed; retrying with simple amix. Error: %s", exc)
+            try:
+                run_cmd(simple_cmd)
+                return
+            except RuntimeError as fallback_exc:
+                logging.warning("Simple amix fallback failed; exporting dubbed-only audio. Error: %s", fallback_exc)
+                run_cmd(build_dub_only_cmd())
+                return
+    else:
+        # Output dubbed speech only, preserving the original video stream.
+        run_cmd(build_dub_only_cmd())
 
 
 def parse_args() -> argparse.Namespace:
@@ -1883,9 +2195,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--asr-engine",
-        default="whisper",
-        choices=["whisper", "stable-ts"],
-        help="Speech recognition engine: 'whisper' (default) or 'stable-ts' for better timestamp accuracy and opening coverage",
+        default="auto",
+        choices=["auto", "whisper", "stable-ts"],
+        help="Speech recognition engine: 'auto' (prefer stable-ts when available), 'whisper', or 'stable-ts'",
     )
     return parser.parse_args()
 
@@ -1909,7 +2221,7 @@ def autodub_video(
     export_srt: bool = True,
     resume_enabled: bool = True,
     glossary_text: str = "",
-    asr_engine: str = "whisper",
+    asr_engine: str = "auto",
     start_time_s: float = 0.0,
     end_time_s: float | None = None,
     keep_temp: bool = False,
@@ -1952,6 +2264,8 @@ def autodub_video(
     if silence_trim_ms < 0:
         raise ValueError("silence_trim_ms must be >= 0")
 
+    resolved_asr_engine = resolve_asr_engine(asr_engine, status_callback=report)
+
     temp_base = Path(tempfile.mkdtemp(prefix="autodub_"))
     try:
         resume_dir = None
@@ -1968,7 +2282,7 @@ def autodub_video(
                 start_time_s=start_time_s,
                 end_time_s=end_time_s,
                 glossary_text=glossary_text,
-                asr_engine=asr_engine,
+                asr_engine=resolved_asr_engine,
             )
             resume_dir.mkdir(parents=True, exist_ok=True)
             report(f"[resume] Cache directory: {resume_dir}")
@@ -2028,7 +2342,7 @@ def autodub_video(
             extract_audio(working_video, extracted_wav)
             report_progress(0.10, "Audio extracted")
 
-        _asr_label = "stable-ts" if asr_engine == "stable-ts" else "Whisper"
+        _asr_label = "stable-ts" if resolved_asr_engine == "stable-ts" else "Whisper"
         report(f"[2/5] Transcribing with {_asr_label}...")
 
         def asr_chunk_progress(done: int, total: int) -> None:
@@ -2052,7 +2366,7 @@ def autodub_video(
                     chunk_progress_callback=asr_chunk_progress,
                     status_callback=report,
                     hf_token=hf_token,
-                    asr_engine=asr_engine,
+                    asr_engine=resolved_asr_engine,
                 )
                 save_segments_to_json(segments, segments_json)
 
@@ -2068,7 +2382,7 @@ def autodub_video(
                 chunk_progress_callback=asr_chunk_progress,
                 status_callback=report,
                 hf_token=hf_token,
-                asr_engine=asr_engine,
+                asr_engine=resolved_asr_engine,
             )
             save_segments_to_json(segments, segments_json)
             report_progress(0.35, f"Transcription complete ({len(segments)} segments)")
@@ -2091,6 +2405,9 @@ def autodub_video(
         if not needs_translation and cached_translation_looks_poor(segments, target_lang):
             report("[resume] Cached translations look low quality; re-translating segments...")
             needs_translation = True
+        if not needs_translation and translation_looks_wrong_language(segments, target_lang):
+            report("[resume] Cached translations appear to be in the wrong language; re-translating segments...")
+            needs_translation = True
         if needs_translation:
             translate_segments_with_progress(
                 segments,
@@ -2099,6 +2416,21 @@ def autodub_video(
                 glossary_overrides=glossary_overrides,
                 translation_provider=translation_provider,
             )
+            if translation_looks_wrong_language(segments, target_lang):
+                report("[translate] Output still looks wrong-language; forcing explicit English->target translation...")
+                translate_segments_with_progress(
+                    segments,
+                    target_lang,
+                    segment_progress_callback=translation_progress,
+                    glossary_overrides=glossary_overrides,
+                    translation_provider=translation_provider,
+                    force_english_source=True,
+                )
+            if translation_looks_wrong_language(segments, target_lang):
+                raise RuntimeError(
+                    "Translation appears to remain in the wrong language for the selected target. "
+                    "Please retry with --no-resume or switch translation provider."
+                )
             save_segments_to_json(segments, segments_json)
         else:
             report("[resume] Reusing cached translations...")
@@ -2133,7 +2465,10 @@ def autodub_video(
         if dubbed_wav.exists() and dub_meta_path.exists():
             try:
                 dub_meta = json.loads(dub_meta_path.read_text(encoding="utf-8"))
-                can_reuse_dubbed_audio = dub_meta.get("signature") == dub_signature
+                can_reuse_dubbed_audio = (
+                    dub_meta.get("signature") == dub_signature
+                    and has_meaningful_audio(dubbed_wav)
+                )
             except Exception:
                 can_reuse_dubbed_audio = False
 
@@ -2142,7 +2477,7 @@ def autodub_video(
             report_progress(0.90, "Synthesizing voice (cached)")
         else:
             if dubbed_wav.exists():
-                report("[resume] Dubbed audio cache is stale; regenerating from current segments...")
+                report("[resume] Dubbed audio cache is stale or silent; regenerating from current segments...")
             report_progress(0.62, "Generating neural voice")
 
             def tts_progress(done: int, total: int) -> None:
@@ -2167,6 +2502,11 @@ def autodub_video(
                 cache_dir=tts_cache_dir,
             )
             dubbed_track.export(dubbed_wav, format="wav")
+            if not has_meaningful_audio(dubbed_wav):
+                raise RuntimeError(
+                    "Generated dubbed audio is silent. "
+                    "Try switching TTS engine/voice and rerun with --no-resume."
+                )
             dub_meta_path.write_text(
                 json.dumps({"signature": dub_signature}, indent=2),
                 encoding="utf-8",

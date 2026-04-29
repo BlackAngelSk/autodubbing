@@ -64,7 +64,8 @@ TRANSLATION_PROVIDER_CHOICES = [
 ]
 
 ASR_ENGINE_CHOICES = [
-    ("Whisper (default, reliable)", "whisper"),
+    ("Auto (recommended: stable-ts when available)", "auto"),
+    ("Whisper (fallback, compatible)", "whisper"),
     ("stable-ts (accurate timestamps, fixes missed opening)", "stable-ts"),
 ]
 
@@ -152,7 +153,7 @@ def run_dub(
     start_time_s: float,
     end_time_s: float | None,
     keep_temp: bool,
-    asr_engine: str = "whisper",
+    asr_engine: str = "auto",
     progress: gr.Progress = gr.Progress(),
 ) -> tuple[str | None, str, str, str | None]:
     logs: list[str] = []
@@ -338,7 +339,7 @@ def build_ui() -> gr.Blocks:
                 asr_engine = gr.Radio(
                     label="ASR Engine",
                     choices=ASR_ENGINE_CHOICES,
-                    value="whisper",
+                    value="auto",
                 )
                 tts_engine = gr.Radio(
                     label="TTS Engine",

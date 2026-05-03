@@ -26,6 +26,7 @@ from deep_translator import GoogleTranslator, MyMemoryTranslator
 from faster_whisper import WhisperModel
 from gtts import gTTS
 from pydub import AudioSegment
+from pydub.effects import compress_dynamic_range, normalize
 from pydub.silence import detect_nonsilent
 from tqdm import tqdm
 
@@ -55,6 +56,37 @@ LARGE_WHISPER_MODELS = {
 TRANSLATION_PROVIDERS = {"google", "mymemory"}
 ASR_ENGINE_CHOICES = {"auto", "whisper", "stable-ts"}
 HF_UNAUTH_WARNING_TEXT = "unauthenticated requests to the hf hub"
+COQUI_DEFAULT_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
+_COQUI_MODEL_CACHE: dict[str, Any] = {}
+COQUI_XTTS_SUPPORTED_LANGS = {
+    "en",
+    "es",
+    "fr",
+    "de",
+    "it",
+    "pt",
+    "pl",
+    "tr",
+    "ru",
+    "nl",
+    "cs",
+    "ar",
+    "zh-cn",
+    "ja",
+    "hu",
+    "ko",
+    "hi",
+}
+COQUI_LANGUAGE_ALIASES = {
+    "pt-br": "pt",
+    "pt-pt": "pt",
+    "zh": "zh-cn",
+    "cz": "cs",
+    "jp": "ja",
+    "kr": "ko",
+    # XTTS does not currently provide native Slovak; Czech is the closest available fallback.
+    "sk": "cs",
+}
 
 
 class _HFUnauthenticatedFilter(logging.Filter):
@@ -559,11 +591,15 @@ def build_dub_cache_signature(
     min_stretch_speed: float,
     max_stretch_speed: float,
     silence_trim_ms: int,
+    coqui_model: str | None = None,
+    coqui_speaker_fingerprint: str | None = None,
 ) -> str:
     payload = {
         "target_lang": target_lang,
         "tts_engine": tts_engine,
         "edge_voice": edge_voice or "",
+        "coqui_model": coqui_model or "",
+        "coqui_speaker_fingerprint": coqui_speaker_fingerprint or "",
         "min_stretch_speed": round(min_stretch_speed, 4),
         "max_stretch_speed": round(max_stretch_speed, 4),
         "silence_trim_ms": int(silence_trim_ms),
@@ -587,9 +623,30 @@ def build_resume_dir(
     glossary_text: str,
     asr_engine: str = "whisper",
 ) -> Path:
+    input_fingerprint = "unknown"
+    try:
+        file_size = input_path.stat().st_size
+        hasher = hashlib.sha1()
+        hasher.update(str(file_size).encode("utf-8"))
+
+        with input_path.open("rb") as handle:
+            head = handle.read(1_048_576)
+            hasher.update(head)
+
+            if file_size > 1_048_576:
+                handle.seek(max(file_size - 1_048_576, 0))
+                tail = handle.read(1_048_576)
+                hasher.update(tail)
+
+        input_fingerprint = hasher.hexdigest()[:16]
+    except OSError:
+        # Keep cache key creation resilient even when stat/read fails.
+        input_fingerprint = "unreadable"
+
     job_signature = "|".join(
         [
             str(input_path.resolve()),
+            input_fingerprint,
             target_lang,
             whisper_model,
             asr_engine,
@@ -688,14 +745,14 @@ def resolve_processing_profile(
 
     if applied_profile == "short":
         resolved_min = max(resolved_min, 0.90)
-        resolved_max = min(max(resolved_max, 1.45), 1.65)
+        resolved_max = min(max(resolved_max, 1.28), 1.42)
         resolved_trim = max(resolved_trim, 18)
         tts_chunk_window_s = 60.0
     elif applied_profile == "long":
         if resolved_device != "cuda" and whisper_model in ({"small", "medium"} | LARGE_WHISPER_MODELS):
             resolved_model = "base"
         resolved_min = min(resolved_min, 0.92)
-        resolved_max = max(resolved_max, 1.95)
+        resolved_max = max(resolved_max, 1.45)
         resolved_trim = max(resolved_trim, 12)
         transcribe_chunk_s = 420.0
         tts_chunk_window_s = 120.0
@@ -733,6 +790,59 @@ def extract_audio(video_path: Path, audio_out: Path) -> None:
             str(audio_out),
         ]
     )
+
+
+def build_coqui_speaker_reference(audio_path: Path, output_wav: Path, max_ref_ms: int = 9_000) -> Path | None:
+    """Extract a stable speaker reference from source audio for Coqui XTTS voice cloning."""
+    if not audio_path.exists():
+        return None
+
+    try:
+        audio = AudioSegment.from_wav(audio_path)
+    except Exception:
+        return None
+
+    if len(audio) < 1_200:
+        return None
+
+    silence_floor = audio.dBFS - 19 if audio.dBFS != float("-inf") else -45
+    speech_ranges = detect_nonsilent(
+        audio,
+        min_silence_len=180,
+        silence_thresh=max(silence_floor, -45),
+    )
+    if not speech_ranges:
+        return None
+
+    merged_ranges: list[tuple[int, int]] = []
+    for start, end in speech_ranges:
+        if not merged_ranges:
+            merged_ranges.append((start, end))
+            continue
+        prev_start, prev_end = merged_ranges[-1]
+        if start <= prev_end + 260:
+            merged_ranges[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged_ranges.append((start, end))
+
+    if not merged_ranges:
+        return None
+
+    best_start, best_end = max(merged_ranges, key=lambda item: item[1] - item[0])
+    if best_end <= best_start + 900:
+        return None
+
+    sample = cast(AudioSegment, audio[best_start:best_end])
+    if len(sample) > max_ref_ms:
+        mid = len(sample) // 2
+        half = max_ref_ms // 2
+        sample = cast(AudioSegment, sample[max(mid - half, 0) : min(mid + half, len(sample))])
+
+    # Mono + standard sample rate keep Coqui speaker embedding stable.
+    sample = sample.set_channels(1).set_frame_rate(22050)
+    output_wav.parent.mkdir(parents=True, exist_ok=True)
+    sample.export(output_wav, format="wav")
+    return output_wav if output_wav.exists() else None
 
 
 def trim_video(input_video: Path, output_video: Path, start_time_s: float, end_time_s: float | None) -> None:
@@ -1666,6 +1776,74 @@ def edge_tts_segment(
     asyncio.run(synthesize())
 
 
+def resolve_coqui_xtts_language(lang: str) -> str | None:
+    normalized = safe_text(lang).strip().lower()
+    normalized = COQUI_LANGUAGE_ALIASES.get(normalized, normalized)
+    if normalized in COQUI_XTTS_SUPPORTED_LANGS:
+        return normalized
+    return None
+
+
+def coqui_tts_segment(
+    text: str,
+    lang: str,
+    output_mp3: Path,
+    speaker_wav: Path | None = None,
+) -> None:
+    try:
+        tts_api_module = importlib.import_module("TTS.api")
+    except ImportError as exc:
+        raise RuntimeError(
+            "Coqui TTS engine is not installed. Install with: pip install TTS"
+        ) from exc
+
+    tts_class = getattr(tts_api_module, "TTS", None)
+    if tts_class is None:
+        raise RuntimeError("Coqui TTS import succeeded, but TTS.api.TTS is unavailable.")
+
+    coqui_model = os.environ.get("AUTODUB_COQUI_MODEL", "").strip()
+    if not coqui_model:
+        coqui_model = COQUI_DEFAULT_MODEL
+
+    tts_model = _COQUI_MODEL_CACHE.get(coqui_model)
+    if tts_model is None:
+        tts_model = tts_class(model_name=coqui_model, progress_bar=False)
+        _COQUI_MODEL_CACHE[coqui_model] = tts_model
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+        temp_wav_path = Path(tmp_wav.name)
+
+    try:
+        synth_kwargs: dict[str, Any] = {
+            "text": text,
+            "file_path": str(temp_wav_path),
+        }
+
+        lower_model_name = coqui_model.lower()
+        if "xtts" in lower_model_name or "multilingual" in lower_model_name:
+            resolved_lang = resolve_coqui_xtts_language(lang)
+            if resolved_lang is None:
+                raise RuntimeError(
+                    f"Coqui XTTS does not support target language '{lang}'. "
+                    "Use Edge TTS for this language or override AUTODUB_COQUI_MODEL."
+                )
+            synth_kwargs["language"] = resolved_lang
+            env_speaker_wav = os.environ.get("AUTODUB_COQUI_SPEAKER_WAV", "").strip()
+            speaker_name = os.environ.get("AUTODUB_COQUI_SPEAKER", "").strip()
+            if speaker_wav is not None and speaker_wav.exists():
+                synth_kwargs["speaker_wav"] = str(speaker_wav)
+            elif env_speaker_wav:
+                synth_kwargs["speaker_wav"] = env_speaker_wav
+            elif speaker_name:
+                synth_kwargs["speaker"] = speaker_name
+
+        tts_model.tts_to_file(**synth_kwargs)
+        AudioSegment.from_wav(temp_wav_path).export(output_mp3, format="mp3")
+    finally:
+        if temp_wav_path.exists():
+            temp_wav_path.unlink(missing_ok=True)
+
+
 def tts_segment(
     text: str,
     lang: str,
@@ -1675,8 +1853,38 @@ def tts_segment(
     edge_rate: str = "+0%",
     edge_pitch: str = "+0Hz",
     edge_volume: str = "+0%",
+    coqui_speaker_wav: Path | None = None,
 ) -> None:
     last_error: Exception | None = None
+    coqui_failed = False
+
+    if tts_engine == "coqui":
+        for attempt in range(2):
+            try:
+                coqui_tts_segment(text, lang, output_mp3, speaker_wav=coqui_speaker_wav)
+                return
+            except Exception as exc:
+                coqui_failed = True
+                last_error = exc
+                time.sleep(0.18 * (attempt + 1))
+
+        # Edge fallback sounds more natural than gTTS for most languages.
+        fallback_voice = edge_voice or DEFAULT_EDGE_VOICES.get(lang)
+        if fallback_voice:
+            for attempt in range(2):
+                try:
+                    edge_tts_segment(
+                        text,
+                        fallback_voice,
+                        output_mp3,
+                        rate=edge_rate,
+                        pitch=edge_pitch,
+                        volume=edge_volume,
+                    )
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    time.sleep(0.18 * (attempt + 1))
 
     if tts_engine == "edge":
         voice = edge_voice or DEFAULT_EDGE_VOICES.get(lang, DEFAULT_EDGE_VOICES["en"])
@@ -1704,6 +1912,11 @@ def tts_segment(
             last_error = exc
             time.sleep(0.18 * (attempt + 1))
 
+    if coqui_failed:
+        raise RuntimeError(
+            "Coqui synthesis failed and fallback engines did not succeed. "
+            f"Last error: {last_error}"
+        )
     raise RuntimeError(f"TTS synthesis failed after retries: {last_error}")
 
 
@@ -1754,23 +1967,23 @@ def build_edge_tts_profile(text: str) -> tuple[str, int, int, str]:
     punctuation_count = len(re.findall(r"[,;:]", spoken_text))
 
     rate_percent = 0
-    if word_count >= 16:
-        rate_percent = -8
-    elif word_count >= 10:
-        rate_percent = -5
-    elif word_count >= 6:
-        rate_percent = -3
+    if word_count >= 20:
+        rate_percent = -6
+    elif word_count >= 13:
+        rate_percent = -4
+    elif word_count >= 8:
+        rate_percent = -2
 
     if punctuation_count >= 2:
-        rate_percent -= 2
+        rate_percent -= 1
 
-    pitch_hz = 2
+    pitch_hz = 0
     if spoken_text.endswith("?"):
-        pitch_hz = 10
+        pitch_hz = 5
     elif spoken_text.endswith("!"):
-        pitch_hz = 7
+        pitch_hz = 3
     elif word_count <= 4:
-        pitch_hz = 4
+        pitch_hz = 1
 
     return spoken_text, rate_percent, pitch_hz, "+0%"
 
@@ -1881,7 +2094,7 @@ def fit_audio_to_duration_with_controls(
         if overflow_speed > 1.08:
             # Keep emergency compression bounded so a single difficult line does
             # not become unnaturally fast.
-            safety_speed = min(max(overflow_speed, 1.0), max(max_stretch_speed + 0.18, 1.95))
+            safety_speed = min(max(overflow_speed, 1.0), max(max_stretch_speed + 0.08, 1.42))
             if abs(safety_speed - 1.0) > 0.08:
                 audio = stretch_audio_preserve_pitch(audio, safety_speed, temp_dir, f"seg_{segment_index:05d}_safe")
 
@@ -1914,6 +2127,13 @@ def has_meaningful_audio(audio_path: Path, min_nonsilent_ms: int = 450) -> bool:
     return nonsilent_ms >= min_nonsilent_ms
 
 
+def enhance_coqui_audio(voice: AudioSegment) -> AudioSegment:
+    """Apply light mastering to Coqui output so speech sounds less flat."""
+    enhanced = normalize(voice, headroom=1.2)
+    enhanced = compress_dynamic_range(enhanced, threshold=-24.0, ratio=2.0, attack=10, release=120)
+    return enhanced
+
+
 def build_dubbed_track(
     segments: List[Segment],
     total_duration_ms: int,
@@ -1927,6 +2147,7 @@ def build_dubbed_track(
     segment_progress_callback: Callable[[int, int], None] | None = None,
     chunk_window_s: float | None = None,
     cache_dir: Path | None = None,
+    coqui_speaker_wav: Path | None = None,
 ) -> AudioSegment:
     dubbed = AudioSegment.silent(duration=total_duration_ms)
     total = len(segments)
@@ -1956,8 +2177,11 @@ def build_dubbed_track(
             edge_rate=rate,
             edge_pitch=pitch,
             edge_volume=volume,
+            coqui_speaker_wav=coqui_speaker_wav,
         )
         cached_audio = AudioSegment.from_file(mp3_path)
+        if tts_engine == "coqui":
+            cached_audio = enhance_coqui_audio(cached_audio)
         voice_cache[cache_key] = cached_audio
         return cached_audio
 
@@ -1988,11 +2212,24 @@ def build_dubbed_track(
 
             edge_rate_percent = base_rate_percent
             if tts_engine == "edge" and slot_ms > 0:
-                desired_ratio = len(get_tts_audio(spoken_text, rate=format_edge_rate(base_rate_percent), pitch=format_edge_pitch(pitch_hz), volume=volume)) / slot_ms
-                if desired_ratio > 1.05:
-                    edge_rate_percent += int(min((desired_ratio - 1.0) * 52, 34))
-                elif desired_ratio < 0.78:
-                    edge_rate_percent -= int(min((1.0 - desired_ratio) * 16, 6))
+                desired_ratio = (
+                    len(
+                        get_tts_audio(
+                            spoken_text,
+                            rate=format_edge_rate(base_rate_percent),
+                            pitch=format_edge_pitch(pitch_hz),
+                            volume=volume,
+                        )
+                    )
+                    / slot_ms
+                )
+                if desired_ratio > 1.08:
+                    edge_rate_percent += int(min((desired_ratio - 1.0) * 18, 10))
+                elif desired_ratio < 0.74:
+                    edge_rate_percent -= int(min((1.0 - desired_ratio) * 8, 4))
+
+                # Keep edge rate near neutral to avoid robotic artifacts.
+                edge_rate_percent = max(min(edge_rate_percent, 12), -12)
 
             edge_rate = format_edge_rate(edge_rate_percent)
             edge_pitch = format_edge_pitch(pitch_hz)
@@ -2001,15 +2238,9 @@ def build_dubbed_track(
             if tts_engine == "edge" and slot_ms > 0:
                 natural_ratio = len(voice) / slot_ms
                 if natural_ratio > max_stretch_speed + 0.12:
-                    adaptive_rate = format_edge_rate(edge_rate_percent + int(min((natural_ratio - 1.0) * 28, 24)))
+                    adaptive_bump = int(min((natural_ratio - 1.0) * 10, 8))
+                    adaptive_rate = format_edge_rate(max(min(edge_rate_percent + adaptive_bump, 14), -12))
                     voice = get_tts_audio(spoken_text, rate=adaptive_rate, pitch=edge_pitch, volume=volume)
-                    # Some lines still run long after one rate bump. Try one stronger pass
-                    # rather than expanding the segment slot and drifting into the next line.
-                    if len(voice) > slot_ms:
-                        second_ratio = len(voice) / slot_ms
-                        if second_ratio > max_stretch_speed + 0.08:
-                            stronger_rate = format_edge_rate(edge_rate_percent + int(min((second_ratio - 1.0) * 34, 28)))
-                            voice = get_tts_audio(spoken_text, rate=stronger_rate, pitch=edge_pitch, volume=volume)
 
             voice = fit_audio_to_duration_with_controls(
                 voice,
@@ -2061,7 +2292,7 @@ def mux_video_with_dub(
     input_video: Path,
     dubbed_wav: Path,
     output_video: Path,
-    background_mix_level: float = 0.08,
+    background_mix_level: float = 0.03,
     include_original_audio: bool = True,
 ) -> None:
     def build_dub_only_cmd() -> list[str]:
@@ -2096,11 +2327,11 @@ def mux_video_with_dub(
             str(dubbed_wav),
             "-filter_complex",
             (
-                f"[1:a]acompressor=threshold=-20dB:ratio=2.2:attack=15:release=140,"
-                f"alimiter=limit=0.97,volume=1.9[dub];"
-                f"[0:a]volume={mix:.3f}[bg];"
-                f"[bg][dub]sidechaincompress=threshold=0.025:ratio=10:attack=20:release=260:makeup=1[ducked];"
-                f"[ducked][dub]amix=inputs=2:weights='0.22 1.78':duration=first:normalize=0[aout]"
+                f"[1:a]aresample=48000,acompressor=threshold=-22dB:ratio=2.8:attack=12:release=180,"
+                f"alimiter=limit=0.97,volume=2.6[dub];"
+                f"[0:a]aresample=48000,highpass=f=120,lowpass=f=6800,volume={mix:.3f}[bg];"
+                f"[bg][dub]sidechaincompress=threshold=0.015:ratio=14:attack=16:release=320:makeup=1.25[ducked];"
+                f"[ducked][dub]amix=inputs=2:weights='0.12 1.88':duration=first:normalize=0[aout]"
             ),
             "-map",
             "0:v",
@@ -2121,7 +2352,7 @@ def mux_video_with_dub(
             "-i",
             str(dubbed_wav),
             "-filter_complex",
-            f"[0:a]volume={mix:.3f}[bg];[1:a]volume=1.9[dub];[bg][dub]amix=inputs=2:weights='0.24 1.76':duration=first:normalize=0[aout]",
+            f"[0:a]volume={mix:.3f}[bg];[1:a]volume=2.6[dub];[bg][dub]amix=inputs=2:weights='0.10 1.90':duration=first:normalize=0[aout]",
             "-map",
             "0:v",
             "-map",
@@ -2169,7 +2400,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional Hugging Face token for faster Whisper model downloads and higher rate limits",
     )
-    parser.add_argument("--tts-engine", default="edge", choices=["edge", "gtts"], help="Speech synthesis engine")
+    parser.add_argument("--tts-engine", default="edge", choices=["edge", "gtts", "coqui"], help="Speech synthesis engine")
     parser.add_argument("--edge-voice", default=None, help="Edge voice name, e.g. en-US-AriaNeural")
     parser.add_argument("--start-time", type=float, default=0.0, help="Start time in seconds for dubbing window")
     parser.add_argument("--end-time", type=float, default=None, help="Optional end time in seconds for dubbing window")
@@ -2212,10 +2443,10 @@ def autodub_video(
     hf_token: str | None = None,
     tts_engine: str = "edge",
     edge_voice: str | None = None,
-    background_mix_level: float = 0.08,
+    background_mix_level: float = 0.03,
     include_original_audio: bool = True,
     min_stretch_speed: float = 0.85,
-    max_stretch_speed: float = 1.80,
+    max_stretch_speed: float = 1.35,
     silence_trim_ms: int = 0,
     optimization_profile: str = "auto",
     export_srt: bool = True,
@@ -2451,6 +2682,22 @@ def autodub_video(
         active_min_stretch = cast(float, resolved_settings["min_stretch_speed"])
         active_max_stretch = cast(float, resolved_settings["max_stretch_speed"])
         active_silence_trim = cast(int, resolved_settings["silence_trim_ms"])
+        coqui_speaker_wav: Path | None = None
+        coqui_speaker_fingerprint = ""
+        coqui_model_name = ""
+        if tts_engine == "coqui":
+            coqui_model_name = os.environ.get("AUTODUB_COQUI_MODEL", "").strip() or COQUI_DEFAULT_MODEL
+            coqui_ref_path = (resume_dir / "coqui_speaker_ref.wav") if resume_dir is not None else (temp_base / "coqui_speaker_ref.wav")
+            if coqui_ref_path.exists() and has_meaningful_audio(coqui_ref_path, min_nonsilent_ms=700):
+                coqui_speaker_wav = coqui_ref_path
+            else:
+                coqui_speaker_wav = build_coqui_speaker_reference(extracted_wav, coqui_ref_path)
+            if coqui_speaker_wav is not None and coqui_speaker_wav.exists():
+                coqui_speaker_fingerprint = f"{coqui_speaker_wav.stat().st_size}:{int(coqui_speaker_wav.stat().st_mtime)}"
+                report("[coqui] Using auto speaker reference from source audio.")
+            else:
+                report("[coqui] Speaker reference unavailable; using default model speaker.")
+
         dub_signature = build_dub_cache_signature(
             segments,
             target_lang=target_lang,
@@ -2459,6 +2706,8 @@ def autodub_video(
             min_stretch_speed=active_min_stretch,
             max_stretch_speed=active_max_stretch,
             silence_trim_ms=active_silence_trim,
+            coqui_model=coqui_model_name,
+            coqui_speaker_fingerprint=coqui_speaker_fingerprint,
         )
 
         can_reuse_dubbed_audio = False
@@ -2500,6 +2749,7 @@ def autodub_video(
                 segment_progress_callback=tts_progress,
                 chunk_window_s=cast(float | None, resolved_settings["tts_chunk_window_s"]),
                 cache_dir=tts_cache_dir,
+                coqui_speaker_wav=coqui_speaker_wav,
             )
             dubbed_track.export(dubbed_wav, format="wav")
             if not has_meaningful_audio(dubbed_wav):

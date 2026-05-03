@@ -105,9 +105,6 @@ SUPPORTED_TTS_UPLOAD_TYPES = [
 ]
 
 
-
-
-
 def voice_for_language(lang: str) -> str:
     return DEFAULT_EDGE_VOICES.get(lang, DEFAULT_EDGE_VOICES["en"])
 
@@ -660,7 +657,7 @@ def build_ui() -> gr.Blocks:
                         )
                         tts_engine = gr.Radio(
                             label="TTS Engine",
-                            choices=["edge", "gtts"],
+                            choices=["edge", "gtts", "coqui"],
                             value="edge",
                             info="Edge sounds more natural in most cases",
                         )
@@ -684,7 +681,7 @@ def build_ui() -> gr.Blocks:
                         )
 
                     with gr.Row():
-                        include_original_audio = gr.Checkbox(label="Keep original audio in background", value=True)
+                        include_original_audio = gr.Checkbox(label="Keep original audio in background", value=False)
                         export_srt = gr.Checkbox(label="Export subtitles (.srt)", value=True)
                         resume_enabled = gr.Checkbox(label="Resume previous job", value=True)
                         keep_temp = gr.Checkbox(label="Keep temp files", value=False)
@@ -775,7 +772,7 @@ def build_ui() -> gr.Blocks:
                     with gr.Column(scale=1):
                         tts_engine_tab = gr.Radio(
                             label="TTS Engine",
-                            choices=["edge", "gtts"],
+                            choices=["edge", "gtts", "coqui"],
                             value="edge",
                             info="Edge sounds more natural",
                         )

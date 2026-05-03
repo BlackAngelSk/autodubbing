@@ -161,7 +161,7 @@ Optional arguments:
 - `--device` (default: `auto`) values: `auto`, `cpu`, `cuda`
 - `--translation-provider` values: `google` (default), `mymemory`
 - `--hf-token` optional Hugging Face token for authenticated Whisper model downloads
-- `--tts-engine` values: `edge` (default), `gtts`
+- `--tts-engine` values: `edge` (default), `gtts`, `coqui` (`pip install TTS`)
 - `--edge-voice` custom voice, example: `en-US-AriaNeural`
 - `--start-time` start second for dubbing window (default: `0`)
 - `--end-time` optional end second for dubbing window
@@ -215,6 +215,13 @@ If `--keep-temp` is passed, the script will show the temp directory path so you 
 - Translation now runs with bounded parallel workers for longer jobs to improve speed while keeping provider load controlled.
 - If voices sound too fast/slow, edit `fit_audio_to_duration` logic in `autodub.py`.
 - For more natural speech, use `edge` engine and a voice matching your target language.
+- If speech still sounds robotic, try `--tts-engine coqui` after installing `TTS`:
+   - `pip install TTS`
+   - Coqui now auto-builds a speaker reference from the input audio for more natural, less flat dubbing.
+   - Optional env vars:
+      - `AUTODUB_COQUI_MODEL` (default: multilingual XTTS v2)
+      - `AUTODUB_COQUI_SPEAKER_WAV` (reference voice wav for XTTS)
+      - `AUTODUB_COQUI_SPEAKER` (speaker id for supported multispeaker models)
 - If the UI does not open, check that Gradio installed successfully: `pip install -r requirements.txt`.
 - On older Windows CPUs, use `install_windows.bat` or `start.bat` so a compatible `numpy==1.26.4` build is installed automatically.
 - If you have an NVIDIA GPU but runs still use CPU, set `--device cuda` explicitly and update GPU dependencies (`faster-whisper`/`ctranslate2` + CUDA runtime libs). The loader now tries multiple CUDA compute modes automatically.

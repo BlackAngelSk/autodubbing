@@ -8,6 +8,7 @@ This project provides a command-line tool that can:
 4. Generate synthetic speech for each translated segment.
 5. Rebuild a dubbed track aligned to the original timing.
 6. Merge the dubbed track back into the video.
+7. Save source and translated transcripts before final TTS synthesis.
 
 It also includes a web UI for easier navigation.
 
@@ -124,6 +125,7 @@ UI flow:
    - `Short video quality` for clips/songs
    - `Long video stability` for longer videos
 5. Keep `TTS Engine` on `edge` for more natural neural speech.
+   - In Video Dubbing, you can choose `edge (Text-to-Speech tab style)` to match the same neutral voicing profile used in the Text-to-Speech tab.
 6. Leave `ASR Engine` on `Auto` unless you need to force Whisper compatibility.
 7. Optionally switch `Translation Provider` between `Google` and `MyMemory`.
 8. Choose an `Edge Voice` (auto-updates when language changes).
@@ -137,6 +139,12 @@ UI flow:
 12. Preview output, download the generated `.srt`, and read logs.
 
 Generated videos are saved in `outputs/`, and resume caches are stored under `outputs/.autodub_resume/`.
+
+Each run also writes transcript files next to the output video:
+- `*.transcript.txt` (detected source speech)
+- `*.translated.txt` (translated text used for TTS)
+
+The video-dubbing TTS now uses the same neutral voice profile defaults as the UI Text-to-Speech tab (for more natural sounding speech).
 
 If using YouTube URL in UI, install:
 
@@ -161,7 +169,7 @@ Optional arguments:
 - `--device` (default: `auto`) values: `auto`, `cpu`, `cuda`
 - `--translation-provider` values: `google` (default), `mymemory`
 - `--hf-token` optional Hugging Face token for authenticated Whisper model downloads
-- `--tts-engine` values: `edge` (default), `gtts`, `coqui` (`pip install TTS`)
+- `--tts-engine` values: `edge_human` (default, most natural), `edge`, `gtts`, `coqui` (`pip install TTS`)
 - `--edge-voice` custom voice, example: `en-US-AriaNeural`
 - `--start-time` start second for dubbing window (default: `0`)
 - `--end-time` optional end second for dubbing window
@@ -207,6 +215,7 @@ If `--keep-temp` is passed, the script will show the temp directory path so you 
 
 - If transcription is slow, try `--whisper-model base`.
 - For the best speech pickup, keep `--asr-engine auto`; it now prefers `stable-ts` and uses a higher-recall Whisper fallback path.
+- ASR now also re-checks long internal timing gaps to recover speech that was said but initially missed between segments.
 - For best transcription quality on a capable GPU, try `--whisper-model large-v3`.
 - The first run of larger Whisper models may download several GB of weights.
 - If you see an HF Hub unauthenticated warning, set `HF_TOKEN` in your shell or paste it into the UI's optional token field.
@@ -215,6 +224,10 @@ If `--keep-temp` is passed, the script will show the temp directory path so you 
 - Translation now runs with bounded parallel workers for longer jobs to improve speed while keeping provider load controlled.
 - If voices sound too fast/slow, edit `fit_audio_to_duration` logic in `autodub.py`.
 - For more natural speech, use `edge` engine and a voice matching your target language.
+- For the most human-like cadence, use `edge_human` (new sentence-level prosody engine).
+- `edge_human` now also uses lighter mastering + stronger rate fitting to reduce robotic stretch artifacts in dubbing.
+- `edge_human` additionally smooths sentence joins (crossfades) and adapts sentence/phrase pacing, which should sound less choppy and more human.
+- TTS output now gets gentle post-processing (EQ + compression + normalization), so voices are smoother and easier to listen to in both Video Dubbing and Text-to-Speech tabs.
 - If speech still sounds robotic, try `--tts-engine coqui` after installing `TTS`:
    - `pip install TTS`
    - Coqui now auto-builds a speaker reference from the input audio for more natural, less flat dubbing.

@@ -20,7 +20,15 @@ import gradio as gr
 from deep_translator import GoogleTranslator, MyMemoryTranslator
 from pydub import AudioSegment
 
-from autodub import DEFAULT_EDGE_VOICES, autodub_video, detect_cuda_available, detect_rocm_available, tts_segment, sanitize_tts_text
+from autodub import (
+    DEFAULT_EDGE_VOICES,
+    autodub_video,
+    detect_cuda_available,
+    detect_rocm_available,
+    tts_segment,
+    sanitize_tts_text,
+    enhance_tts_audio,
+)
 
 
 LANGUAGE_CHOICES = [
@@ -78,6 +86,14 @@ ASR_ENGINE_CHOICES = [
 
 AUTO_DEVICE = "cuda" if detect_cuda_available() else ("rocm" if detect_rocm_available() else "cpu")
 
+VIDEO_TTS_ENGINE_CHOICES = [
+    ("edge (adaptive dubbing)", "edge"),
+    ("edge (Text-to-Speech tab style)", "edge_page"),
+    ("edge_human (new, most natural)", "edge_human"),
+    ("gtts", "gtts"),
+    ("coqui", "coqui"),
+]
+
 SUPPORTED_TTS_UPLOAD_TYPES = [
     ".txt",
     ".text",
@@ -113,7 +129,7 @@ def _update_edge_voice_dropdown(lang: str, tts_engine: str) -> gr.Dropdown:
     return gr.Dropdown(
         choices=EDGE_VOICE_CHOICES,
         value=voice_for_language(lang),
-        interactive=tts_engine == "edge",
+        interactive=tts_engine in {"edge", "edge_page", "edge_human"},
     )
 
 
@@ -271,6 +287,8 @@ def synthesize_text_unlimited(
             edge_pitch=edge_pitch,
             edge_volume=edge_volume,
         )
+        polished_single = enhance_tts_audio(AudioSegment.from_file(output_mp3, format="mp3"), tts_engine)
+        polished_single.export(output_mp3, format="mp3")
         if progress_callback is not None:
             progress_callback(1.0, "Synthesis complete")
         return 1
@@ -294,6 +312,7 @@ def synthesize_text_unlimited(
             )
 
             piece = AudioSegment.from_file(chunk_path, format="mp3")
+            piece = enhance_tts_audio(piece, tts_engine)
             if len(combined) > 0:
                 combined += AudioSegment.silent(duration=140)
             combined += piece
@@ -459,6 +478,9 @@ def run_dub(
         progress(value, desc=desc)
 
     try:
+        use_page_tts_profile = tts_engine in {"edge_page", "edge_human"}
+        selected_tts_engine = "edge" if tts_engine in {"edge", "edge_page"} else tts_engine
+
         autodub_video(
             input_path=input_path,
             output_path=output_path,
@@ -468,8 +490,9 @@ def run_dub(
             optimization_profile=optimization_profile,
             translation_provider=translation_provider,
             hf_token=(hf_token or "").strip() or None,
-            tts_engine=tts_engine,
-            edge_voice=edge_voice if tts_engine == "edge" else None,
+            tts_engine=selected_tts_engine,
+            use_page_tts_profile=use_page_tts_profile,
+            edge_voice=edge_voice if selected_tts_engine in {"edge", "edge_human"} else None,
             include_original_audio=include_original_audio,
             export_srt=export_srt,
             resume_enabled=resume_enabled,
@@ -657,9 +680,9 @@ def build_ui() -> gr.Blocks:
                         )
                         tts_engine = gr.Radio(
                             label="TTS Engine",
-                            choices=["edge", "gtts", "coqui"],
-                            value="edge",
-                            info="Edge sounds more natural in most cases",
+                            choices=VIDEO_TTS_ENGINE_CHOICES,
+                            value="edge_human",
+                            info="edge_human is the most natural option; it uses sentence-level cadence and pauses",
                         )
                         edge_voice = gr.Dropdown(
                             label="Edge Voice",
@@ -772,9 +795,9 @@ def build_ui() -> gr.Blocks:
                     with gr.Column(scale=1):
                         tts_engine_tab = gr.Radio(
                             label="TTS Engine",
-                            choices=["edge", "gtts", "coqui"],
-                            value="edge",
-                            info="Edge sounds more natural",
+                            choices=["edge", "edge_human", "gtts", "coqui"],
+                            value="edge_human",
+                            info="edge_human uses sentence-level prosody to sound less robotic",
                         )
                         tts_translation_provider = gr.Radio(
                             label="Translation Provider",
